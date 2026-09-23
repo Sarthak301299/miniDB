@@ -1,5 +1,6 @@
 #pragma once
 #include <list>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -15,20 +16,27 @@ struct Frame {
   bool is_dirty = false;
 };
 
-class BufferPool {
- private:
-  Frame* FindFrame(PageId page_id);
-  Frame* EvictFrame();
-  size_t pool_size;
-  DiskManager* disk;
-  WALManager* wal;
+struct Shard {
+  std::mutex latch;
   std::vector<Frame> frames;
   std::unordered_map<PageId, size_t> page_table;
   std::list<size_t> lru;
-  std::mutex latch;
+  std::vector<std::list<size_t>::iterator> lru_pos;
+};
+
+class BufferPool {
+ private:
+  size_t ShardFor(PageId page_id) const;
+  Frame* FindFrameInShard(Shard& shard, PageId page_id);
+  Frame* EvictFrameInShard(Shard& shard);
+  size_t pool_size;
+  DiskManager* disk;
+  WALManager* wal;
+  std::vector<std::unique_ptr<Shard>> shards;
 
  public:
-  BufferPool(size_t pool_size, DiskManager* disk, WALManager* wal);
+  BufferPool(size_t pool_size, DiskManager* disk, WALManager* wal,
+             size_t num_shards = 8);
   Page* FetchPage(PageId page_id);
   Page* NewPage(PageId* out_page_id);
   void UnpinPage(PageId page_id, bool is_dirty);

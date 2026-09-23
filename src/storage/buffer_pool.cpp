@@ -6,83 +6,106 @@
 #include <vector>
 
 namespace minidb {
-Frame* BufferPool::FindFrame(PageId page_id) {
-  if (!page_table.contains(page_id)) return nullptr;
-  return &frames[page_table[page_id]];
+size_t BufferPool::ShardFor(PageId page_id) const {
+  return static_cast<size_t>(page_id) % shards.size();
 }
 
-Frame* BufferPool::EvictFrame() {
-  for (auto& frame : frames) {
+Frame* BufferPool::FindFrameInShard(Shard& shard, PageId page_id) {
+  if (!shard.page_table.contains(page_id)) return nullptr;
+  return &shard.frames[shard.page_table[page_id]];
+}
+
+Frame* BufferPool::EvictFrameInShard(Shard& shard) {
+  for (auto& frame : shard.frames) {
     if (frame.page_id == INVALID_PAGE_ID) return &frame;
   }
-  for (auto it = lru.rbegin(); it != lru.rend(); ++it) {
+  for (auto it = shard.lru.rbegin(); it != shard.lru.rend(); ++it) {
     size_t idx = *it;
-    Frame& f = frames[idx];
+    Frame& f = shard.frames[idx];
     if (f.pin_count == 0) {
       if (f.is_dirty) {
         wal->Flush(f.page.GetLSN());
         disk->WritePage(f.page_id, f.page.GetData());
       }
-      page_table.erase(f.page_id);
-      lru.erase(std::next(it).base());
+      shard.page_table.erase(f.page_id);
+      shard.lru.erase(std::next(it).base());
       f.page_id = INVALID_PAGE_ID;
       f.is_dirty = false;
       return &f;
     }
   }
-  throw std::runtime_error("BufferPool: Pool exhausted. All frames pinned");
+  throw std::runtime_error("BufferPool: Shard exhausted. All frames pinned");
 }
 
-BufferPool::BufferPool(size_t pool_size, DiskManager* disk, WALManager* wal)
-    : pool_size(pool_size), disk(disk), wal(wal), frames(pool_size) {}
+BufferPool::BufferPool(size_t pool_size, DiskManager* disk, WALManager* wal,
+                       size_t num_shards)
+    : pool_size(pool_size), disk(disk), wal(wal) {
+  num_shards = std::max<size_t>(1, std::min(num_shards, pool_size));
+  size_t base = pool_size / num_shards;
+  size_t rem = pool_size % num_shards;
+
+  shards.reserve(num_shards);
+  for (size_t i = 0; i < num_shards; ++i) {
+    size_t shard_frame_count = base + (i < rem ? 1 : 0);
+    auto shard = std::make_unique<Shard>();
+    shard->frames.resize(shard_frame_count);
+    shard->lru_pos.resize(shard_frame_count);
+    shards.push_back(std::move(shard));
+  }
+}
 
 Page* BufferPool::FetchPage(PageId page_id) {
-  std::lock_guard<std::mutex> lock(latch);
-  if (Frame* f = FindFrame(page_id)) {
-    size_t idx = static_cast<size_t>(f - &frames[0]);
+  Shard& shard = *shards[ShardFor(page_id)];
+  std::lock_guard<std::mutex> lock(shard.latch);
+  if (Frame* f = FindFrameInShard(shard, page_id)) {
+    size_t idx = static_cast<size_t>(f - &shard.frames[0]);
     f->pin_count++;
-    lru.remove(idx);
-    lru.push_front(idx);
+    shard.lru.erase(shard.lru_pos[idx]);
+    shard.lru_pos[idx] = shard.lru.insert(shard.lru.begin(), idx);
     return &(f->page);
   }
-  Frame* f = EvictFrame();
+  Frame* f = EvictFrameInShard(shard);
   disk->ReadPage(page_id, f->page.GetData());
   f->page_id = page_id;
   f->pin_count = 1;
   f->is_dirty = false;
-  size_t idx = static_cast<size_t>(f - &frames[0]);
-  page_table[page_id] = idx;
-  lru.push_front(idx);
+  size_t idx = static_cast<size_t>(f - &shard.frames[0]);
+  shard.page_table[page_id] = idx;
+  shard.lru_pos[idx] = shard.lru.insert(shard.lru.begin(), idx);
   return &(f->page);
 }
 
 Page* BufferPool::NewPage(PageId* out_page_id) {
   PageId page_id = disk->AllocatePage();
-  std::lock_guard<std::mutex> lock(latch);
-  Frame* f = EvictFrame();
+  Shard& shard = *shards[ShardFor(page_id)];
+  std::lock_guard<std::mutex> lock(shard.latch);
+  Frame* f = EvictFrameInShard(shard);
   f->page = Page{};
   f->page_id = page_id;
   f->pin_count = 1;
   f->is_dirty = true;
-  size_t idx = static_cast<size_t>(f - &frames[0]);
-  page_table[page_id] = idx;
-  lru.push_front(idx);
+  size_t idx = static_cast<size_t>(f - &shard.frames[0]);
+  shard.page_table[page_id] = idx;
+  shard.lru_pos[idx] = shard.lru.insert(shard.lru.begin(), idx);
   *out_page_id = page_id;
   return &(f->page);
 }
 
 void BufferPool::UnpinPage(PageId page_id, bool is_dirty) {
-  std::lock_guard<std::mutex> lock(latch);
-  if (Frame* f = FindFrame(page_id)) {
+  Shard& shard = *shards[ShardFor(page_id)];
+  std::lock_guard<std::mutex> lock(shard.latch);
+  if (Frame* f = FindFrameInShard(shard, page_id)) {
+    if (!f) return;
     if (f->pin_count > 0) f->pin_count--;
     f->is_dirty = f->is_dirty || is_dirty;
   }
 }
 
 void BufferPool::FlushPage(PageId page_id) {
-  std::lock_guard<std::mutex> lock(latch);
-  if (Frame* f = FindFrame(page_id)) {
-    if (f->is_dirty) {
+  Shard& shard = *shards[ShardFor(page_id)];
+  std::lock_guard<std::mutex> lock(shard.latch);
+  if (Frame* f = FindFrameInShard(shard, page_id)) {
+    if (f && f->is_dirty) {
       wal->Flush(f->page.GetLSN());
       disk->WritePage(page_id, f->page.GetData());
       f->is_dirty = false;
@@ -91,20 +114,26 @@ void BufferPool::FlushPage(PageId page_id) {
 }
 
 LSN BufferPool::Checkpoint() {
-  std::lock_guard<std::mutex> lock(latch);
   LSN max_lsn = INVALID_LSN;
-  for (auto& [page_id, idx] : page_table) {
-    Frame& f = frames[idx];
-    if (f.is_dirty) {
-      max_lsn = std::max(max_lsn, f.page.GetLSN());
+  for (auto& shard : shards) {
+    std::lock_guard<std::mutex> lock(shard->latch);
+    for (auto& [page_id, idx] : shard->page_table) {
+      Frame& f = shard->frames[idx];
+      if (f.is_dirty && f.pin_count == 0) {
+        max_lsn = std::max(max_lsn, f.page.GetLSN());
+      }
     }
   }
   if (max_lsn != INVALID_LSN) wal->Flush(max_lsn);
-  for (auto& [page_id, idx] : page_table) {
-    Frame& f = frames[idx];
-    if (f.is_dirty) {
-      disk->WritePage(page_id, f.page.GetData());
-      f.is_dirty = false;
+  for (auto& shard : shards) {
+    std::lock_guard<std::mutex> lock(shard->latch);
+    for (auto& [page_id, idx] : shard->page_table) {
+      Frame& f = shard->frames[idx];
+      if (f.is_dirty && f.pin_count == 0) {
+        wal->Flush(f.page.GetLSN());
+        disk->WritePage(page_id, f.page.GetData());
+        f.is_dirty = false;
+      }
     }
   }
   disk->Sync();

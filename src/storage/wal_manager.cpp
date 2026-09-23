@@ -116,7 +116,7 @@ void WALManager::Flush(LSN upto) {
     uint32_t len = static_cast<uint32_t>(bytes.size());
     if (::write(fd, &len, sizeof(len)) != static_cast<ssize_t>(sizeof(len)) ||
         ::write(fd, bytes.data(), bytes.size()) !=
-            static_cast<ssize_t>(sizeof(bytes.size()))) {
+            static_cast<ssize_t>(bytes.size())) {
       throw std::runtime_error("WALManager: write failed: " +
                                std::string(std::strerror(errno)));
     }
