@@ -1,0 +1,48 @@
+# ==========================================
+# CMake Generated Files and Directories
+# ==========================================
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+*-prefix/
+
+# ==========================================
+# Common Build Directories
+# ==========================================
+# In-source or standardized build paths
+build/
+build-*/
+out/
+
+# ==========================================
+# IDE and Editor Specific Build Artifacts
+# ==========================================
+# CLion (JetBrains) 
+.idea/
+cmake-build-*/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+CMakeLists.txt.user*
+
+# ==========================================
+# Compiled Binaries and Libraries (Optional)
+# ==========================================
+*.exe
+*.out
+*.app
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.o
+*.obj
