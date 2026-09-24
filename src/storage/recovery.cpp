@@ -9,6 +9,7 @@ size_t RecoveryManager::Recover() {
   LSN last_checkpoint_lsn = INVALID_LSN;
   for (auto& r : records) {
     if (r.type == WALRecordType::CHECKPOINT) last_checkpoint_lsn = r.lsn;
+    if (r.type == WALRecordType::UPDATE) disk->AdvancePastPage(r.page_id);
   }
 
   size_t redone = 0;

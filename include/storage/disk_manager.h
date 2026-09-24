@@ -17,6 +17,7 @@ class DiskManager {
   void ReadPage(PageId page_id, char* out);
   void WritePage(PageId page_id, const char* data);
   PageId AllocatePage();
+  void AdvancePastPage(PageId page_id);
   void Sync();
 };
 }  // namespace minidb

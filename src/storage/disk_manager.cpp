@@ -55,6 +55,15 @@ PageId DiskManager::AllocatePage() {
   return next_page_id.fetch_add(1, std::memory_order_relaxed);
 }
 
+void DiskManager::AdvancePastPage(PageId page_id) {
+  PageId desired = page_id + 1;
+  PageId current = next_page_id.load(std::memory_order_relaxed);
+  while (current < desired &&
+         !next_page_id.compare_exchange_weak(current, desired,
+                                             std::memory_order_relaxed)) {
+  }
+}
+
 void DiskManager::Sync() {
   if (::fsync(fd) != 0) {
     throw std::runtime_error("DiskManager: fsync failed : " +

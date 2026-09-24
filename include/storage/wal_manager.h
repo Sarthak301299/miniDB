@@ -12,6 +12,7 @@ enum class WALRecordType : uint8_t {
   COMMIT,
   UPDATE,
   CHECKPOINT,
+  ABORT,
 };
 
 struct WALRecord {
