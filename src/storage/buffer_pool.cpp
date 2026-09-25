@@ -66,6 +66,10 @@ Page* BufferPool::FetchPage(PageId page_id) {
   }
   Frame* f = EvictFrameInShard(shard);
   disk->ReadPage(page_id, f->page.GetData());
+  if (page_id == 0) {
+    uint16_t nt;
+    std::memcpy(&nt, f->page.GetData() + Page::HeaderSize(), sizeof(nt));
+  }
   f->page_id = page_id;
   f->pin_count = 1;
   f->is_dirty = false;

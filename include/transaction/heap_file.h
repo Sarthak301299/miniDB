@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -42,9 +43,15 @@ class HeapFile {
   mutable std::mutex latch;
   std::vector<PageId> pages;
   PageId current_insert_page = INVALID_PAGE_ID;
+  std::function<void(PageId)> on_new_page;
 
  public:
   HeapFile(BufferPool* pool, WALManager* wal);
+  HeapFile(BufferPool* pool, WALManager* wal,
+           std::vector<PageId> existing_pages);
+  void SetOnNewPageCallback(std::function<void(PageId)> cb) {
+    on_new_page = cb;
+  };
   RID InsertTuple(Transaction* txn, const std::vector<char>& data);
   bool DeleteTuple(Transaction* txn, const RID rid);
   std::vector<std::pair<RID, std::vector<char>>> Scan(

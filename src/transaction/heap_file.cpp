@@ -24,6 +24,14 @@ std::mutex& HeapFile::GetShardLatch(PageId page_id) const {
 
 HeapFile::HeapFile(BufferPool* pool, WALManager* wal) : pool(pool), wal(wal) {}
 
+HeapFile::HeapFile(BufferPool* pool, WALManager* wal,
+                   std::vector<PageId> existing_pages)
+    : pool(pool), wal(wal), pages(std::move(existing_pages)) {
+  if (!pages.empty()) {
+    current_insert_page = pages.back();
+  }
+}
+
 RID HeapFile::InsertTuple(Transaction* txn, const std::vector<char>& data) {
   TupleHeader header;
   header.xmin = txn->id;
@@ -32,13 +40,17 @@ RID HeapFile::InsertTuple(Transaction* txn, const std::vector<char>& data) {
   size_t needed = sizeof(Slot) + sizeof(TupleHeader) + data.size();
   while (true) {
     PageId target;
+    PageId newly_allocated = INVALID_PAGE_ID;
     {
       std::lock_guard<std::mutex> lock(latch);
       if (current_insert_page == INVALID_PAGE_ID) {
         current_insert_page = AllocateNewPage();
+        newly_allocated = current_insert_page;
       }
       target = current_insert_page;
     }
+    if (newly_allocated != INVALID_PAGE_ID && on_new_page)
+      on_new_page(newly_allocated);
     std::lock_guard<std::mutex> shard_lock(GetShardLatch(target));
     Page* page = pool->FetchPage(target);
     char* base = page->GetData() + Page::HeaderSize();
@@ -47,11 +59,16 @@ RID HeapFile::InsertTuple(Transaction* txn, const std::vector<char>& data) {
     if (static_cast<size_t>(page_header.free_end - page_header.free_start) <
         needed) {
       pool->UnpinPage(target, false);
+      PageId rolled_over = INVALID_PAGE_ID;
       {
         std::lock_guard<std::mutex> lock(latch);
-        if (current_insert_page == target)
+        if (current_insert_page == target) {
           current_insert_page = AllocateNewPage();
+          rolled_over = current_insert_page;
+        }
       }
+      if (rolled_over != INVALID_PAGE_ID && on_new_page)
+        on_new_page(rolled_over);
       continue;
     }
     uint16_t tuple_length =

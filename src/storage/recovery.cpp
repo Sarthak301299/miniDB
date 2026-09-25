@@ -23,6 +23,11 @@ size_t RecoveryManager::Recover() {
 
     std::memcpy(page.GetData() + Page::HeaderSize() + r.offset,
                 r.after_image.data(), r.after_image.size());
+    if (r.page_id == 0) {
+      uint16_t nt;
+      std::memcpy(&nt, page.GetData() + Page::HeaderSize() + r.offset,
+                  sizeof(nt));
+    }
     page.SetLSN(r.lsn);
     disk->WritePage(r.page_id, page.GetData());
     redone++;
