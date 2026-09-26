@@ -14,7 +14,7 @@
 namespace minidb {
 struct RID {
   PageId page_id = INVALID_PAGE_ID;
-  uint32_t slot = 0;
+  uint16_t slot = 0;
   bool operator==(const RID& other) const {
     return page_id == other.page_id && slot == other.slot;
   }
@@ -57,6 +57,7 @@ class HeapFile {
   std::vector<std::pair<RID, std::vector<char>>> Scan(
       TxnId txn_id, const TransactionManager& manager);
   bool ReadTuple(RID rid, TupleHeader* out_header, std::vector<char>* out_data);
+  std::vector<std::pair<RID, std::vector<char>>> ScanAllPhysical();
   std::vector<PageId> GetAllPageIds() const;
 };
 }  // namespace minidb

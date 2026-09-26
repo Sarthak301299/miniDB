@@ -162,13 +162,56 @@ std::vector<std::pair<RID, std::vector<char>>> HeapFile::Scan(
           TupleHeader header;
           std::memcpy(&header, base + slot.offset, sizeof(header));
           if (manager.isVisible(header, txn_id)) {
-            std::vector<char> data(slot.length - sizeof(TupleHeader));
+            std::vector<char> data(header.data_len);
             if (header.data_len > 0) {
               std::memcpy(data.data(), base + slot.offset + sizeof(TupleHeader),
                           header.data_len);
             }
             out.push_back({RID{page_id, slot_index}, std::move(data)});
           }
+        }
+        pool->UnpinPage(page_id, false);
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<std::pair<RID, std::vector<char>>> HeapFile::ScanAllPhysical() {
+  std::vector<std::pair<RID, std::vector<char>>> out;
+  std::vector<PageId> pages_copy;
+  {
+    std::lock_guard<std::mutex> lock(latch);
+    pages_copy = pages;
+  }
+  std::array<std::vector<PageId>, num_shards> pages_by_shards;
+  for (PageId page_id : pages_copy) {
+    pages_by_shards[static_cast<size_t>(page_id) % num_shards].push_back(
+        page_id);
+  }
+  for (size_t shard = 0; shard < num_shards; ++shard) {
+    if (!pages_by_shards[shard].empty()) {
+      std::lock_guard<std::mutex> shard_lock(shard_latches[shard]);
+      for (PageId page_id : pages_by_shards[shard]) {
+        Page* page = pool->FetchPage(page_id);
+        char* base = page->GetData() + Page::HeaderSize();
+        SlotPageHeader page_header;
+        std::memcpy(&page_header, base, sizeof(page_header));
+        for (uint16_t slot_index = 0; slot_index < page_header.num_slots;
+             ++slot_index) {
+          Slot slot;
+          std::memcpy(&slot,
+                      base + sizeof(SlotPageHeader) + slot_index * sizeof(Slot),
+                      sizeof(slot));
+          TupleHeader header;
+          std::memcpy(&header, base + slot.offset, sizeof(header));
+
+          std::vector<char> data(header.data_len);
+          if (header.data_len > 0) {
+            std::memcpy(data.data(), base + slot.offset + sizeof(TupleHeader),
+                        header.data_len);
+          }
+          out.push_back({RID{page_id, slot_index}, std::move(data)});
         }
         pool->UnpinPage(page_id, false);
       }

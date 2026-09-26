@@ -22,6 +22,37 @@ bool SeqScanExecutor::Next(std::vector<Value>* out_row) {
 
 void SeqScanExecutor::Close() { rows.clear(); }
 
+IndexScanExecutor::IndexScanExecutor(BPlusTree* tree, int64_t key,
+                                     HeapFile* heap, const Schema* schema,
+                                     TxnId reader_txn,
+                                     const TransactionManager* txn_mgr)
+    : tree(tree),
+      key(key),
+      heap(heap),
+      schema(schema),
+      reader_txn(reader_txn),
+      txn_mgr(txn_mgr) {}
+
+void IndexScanExecutor::Open() {
+  rows.clear();
+  for (const auto& rid : tree->Search(key)) {
+    TupleHeader hdr;
+    std::vector<char> bytes;
+    if (heap->ReadTuple(rid, &hdr, &bytes) &&
+        txn_mgr->isVisible(hdr, reader_txn))
+      rows.push_back(DeserializeRow(*schema, bytes));
+  }
+  pos = 0;
+}
+
+bool IndexScanExecutor::Next(std::vector<Value>* out_row) {
+  if (pos >= rows.size()) return false;
+  *out_row = rows[pos++];
+  return true;
+}
+
+void IndexScanExecutor::Close() { rows.clear(); }
+
 FilterExecutor::FilterExecutor(std::unique_ptr<Executor> child,
                                const Schema* schema,
                                std::vector<Predicate> predicates)

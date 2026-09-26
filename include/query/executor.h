@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 
+#include "btree.h"
 #include "heap_file.h"
 #include "parser.h"
 #include "value.h"
@@ -28,6 +29,26 @@ class SeqScanExecutor : public Executor {
  public:
   SeqScanExecutor(HeapFile* heap, const Schema* schema, TxnId reader_txn,
                   const TransactionManager* txn_mgr);
+  void Open() override;
+  bool Next(std::vector<Value>* out_row) override;
+  void Close() override;
+};
+
+class IndexScanExecutor : public Executor {
+ private:
+  BPlusTree* tree;
+  int64_t key;
+  HeapFile* heap;
+  const Schema* schema;
+  TxnId reader_txn;
+  const TransactionManager* txn_mgr;
+  std::vector<std::vector<Value>> rows;
+  size_t pos = 0;
+
+ public:
+  IndexScanExecutor(BPlusTree* tree, int64_t key, HeapFile* heap,
+                    const Schema* schema, TxnId reader_txn,
+                    const TransactionManager* txn_mgr);
   void Open() override;
   bool Next(std::vector<Value>* out_row) override;
   void Close() override;

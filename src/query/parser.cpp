@@ -42,6 +42,11 @@ class Lexer {
     if (s[pos] == '-') pos++;
     while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos])))
       pos++;
+    if (pos < s.size() && s[pos] == '.') {
+      pos++;
+      while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos])))
+        pos++;
+    }
     return {TokenType::NUMBER, s.substr(start, pos - start)};
   }
 
@@ -58,6 +63,11 @@ class Lexer {
 
   Token ReadOperator() {
     size_t start = pos;
+    if (s[pos] == '<' && pos + 2 < s.size() && s[pos + 1] == '-' &&
+        s[pos + 2] == '>') {
+      pos += 3;
+      return {TokenType::SYMBOL, "<->"};
+    }
     pos++;
     if (pos < s.size() && s[pos] == '=') pos++;
     return {TokenType::SYMBOL, s.substr(start, pos - start)};
@@ -84,7 +94,7 @@ class Lexer {
         tokens.push_back(ReadString());
       } else if (c == '<' || c == '>' || c == '!' || c == '=') {
         tokens.push_back(ReadOperator());
-      } else if (std::string("(),;*").find(c) != std::string::npos) {
+      } else if (std::string("(),;*[]").find(c) != std::string::npos) {
         pos++;
         tokens.push_back({TokenType::SYMBOL, std::string(1, c)});
       } else {
@@ -102,6 +112,9 @@ class Parser {
   size_t pos;
   const Token& Peek() const { return tokens[pos]; }
   const Token& Advance() { return tokens[pos++]; }
+  const Token& PeekNext() const {
+    return tokens[pos + 1 < tokens.size() ? pos + 1 : tokens.size() - 1];
+  }
 
   void ExpectKeyword(const std::string& kw) {
     if (Upper(Peek().text) != kw) {
@@ -134,7 +147,28 @@ class Parser {
     return Peek().type == TokenType::IDENT && Upper(Peek().text) == kw;
   }
 
+  std::vector<float> ParseVectorLiteral() {
+    ExpectSymbol("[");
+    std::vector<float> v;
+    if (!AtSymbol("]")) {
+      while (true) {
+        if (Peek().type != TokenType::NUMBER)
+          throw std::runtime_error("Expected a number is vector literal, got" +
+                                   Peek().text);
+        v.push_back(std::stof(Advance().text));
+        if (AtSymbol(",")) {
+          Advance();
+          continue;
+        }
+        break;
+      }
+    }
+    ExpectSymbol("]");
+    return v;
+  }
+
   Value ExpectLiteral() {
+    if (AtSymbol("[")) return Value::Vector(ParseVectorLiteral());
     if (Peek().type == TokenType::NUMBER)
       return Value::Int(std::stoll(Advance().text));
     if (Peek().type == TokenType::STRING) return Value::Text(Advance().text);
@@ -143,7 +177,6 @@ class Parser {
   }
 
   CreateTableStmt ParseCreateTable() {
-    ExpectKeyword("CREATE");
     ExpectKeyword("TABLE");
     CreateTableStmt stmt;
     stmt.table = ExpectIdent();
@@ -152,11 +185,19 @@ class Parser {
       Column col;
       col.name = ExpectIdent();
       std::string type_kw = Upper(ExpectIdent());
-      if (type_kw == "INT" || type_kw == "INTEGER")
+      if (type_kw == "INT" || type_kw == "INTEGER") {
         col.type = ColumnType::INTEGER;
-      else if (type_kw == "TEXT" || type_kw == "VARCHAR")
+      } else if (type_kw == "TEXT" || type_kw == "VARCHAR") {
         col.type = ColumnType::TEXT;
-      else
+      } else if (type_kw == "VECTOR") {
+        col.type = ColumnType::VECTOR;
+        ExpectSymbol("(");
+        if (Peek().type != TokenType::NUMBER)
+          throw std::runtime_error(
+              "Expected a dimension number in VECTOR(dim), got " + Peek().text);
+        col.dim = static_cast<uint32_t>(std::stoul(Advance().text));
+        ExpectSymbol(")");
+      } else
         throw std::runtime_error("ParseCreateTable: Unknown column type " +
                                  type_kw + " (supported: INT, TEXT)");
 
@@ -170,6 +211,57 @@ class Parser {
       break;
     }
     ExpectSymbol(")");
+    if (AtSymbol(";")) Advance();
+    return stmt;
+  }
+
+  CreateIndexStmt ParseCreateIndex() {
+    ExpectKeyword("INDEX");
+    CreateIndexStmt stmt;
+    stmt.index_name = ExpectIdent();
+    ExpectKeyword("ON");
+    stmt.table = ExpectIdent();
+    ExpectSymbol("(");
+    stmt.column = ExpectIdent();
+    ExpectSymbol(")");
+    if (AtSymbol(";")) Advance();
+    return stmt;
+  }
+
+  CreateVectorIndexStmt ParseCreateVectorIndex() {
+    ExpectKeyword("VECTOR");
+    ExpectKeyword("INDEX");
+    CreateVectorIndexStmt stmt;
+    stmt.index_name = ExpectIdent();
+    ExpectKeyword("ON");
+    stmt.table = ExpectIdent();
+    ExpectSymbol("(");
+    stmt.column = ExpectIdent();
+    ExpectSymbol(")");
+    ExpectKeyword("LISTS");
+    if (Peek().type != TokenType::NUMBER)
+      throw std::runtime_error("Expected a number after LISTS, got " +
+                               Peek().text);
+    stmt.num_clusters = static_cast<uint32_t>(std::stoul(Advance().text));
+    if (AtSymbol(";")) Advance();
+    return stmt;
+  }
+
+  Statement ParseCreate() {
+    ExpectKeyword("CREATE");
+    if (AtKeyword("TABLE")) return ParseCreateTable();
+    if (AtKeyword("INDEX")) return ParseCreateIndex();
+    if (AtKeyword("VECTOR")) return ParseCreateVectorIndex();
+    throw std::runtime_error(
+        "ParseCreate: Expected TABLE or INDEX after CREATE, got " +
+        Peek().text);
+  }
+
+  RefreshColumnarStmt ParseRefreshColumnar() {
+    ExpectKeyword("REFRESH");
+    ExpectKeyword("COLUMNAR");
+    RefreshColumnarStmt stmt;
+    stmt.table = ExpectIdent();
     if (AtSymbol(";")) Advance();
     return stmt;
   }
@@ -221,7 +313,29 @@ class Parser {
   SelectStmt ParseSelect() {
     ExpectKeyword("SELECT");
     SelectStmt stmt;
-    if (AtSymbol("*")) {
+    static const std::vector<std::string> aggFuncs = {"SUM", "AVG", "MIN",
+                                                      "MAX", "COUNT"};
+    bool is_agg = Peek().type == TokenType::IDENT &&
+                  std::find(aggFuncs.begin(), aggFuncs.end(),
+                            Upper(Peek().text)) != aggFuncs.end() &&
+                  PeekNext().type == TokenType::SYMBOL &&
+                  PeekNext().text == "(";
+    if (is_agg) {
+      AggregateSpec agg;
+      agg.func = Upper(Advance().text);
+      ExpectSymbol("(");
+      if (AtSymbol("*")) {
+        if (agg.func != "COUNT")
+          throw std::runtime_error(agg.func +
+                                   "(*) is not supported. Only COUNT(*) is");
+        Advance();
+        agg.column = "*";
+      } else {
+        agg.column = ExpectIdent();
+      }
+      ExpectSymbol(")");
+      stmt.aggregate = agg;
+    } else if (AtSymbol("*")) {
       Advance();
     } else {
       while (true) {
@@ -238,6 +352,25 @@ class Parser {
     if (AtKeyword("WHERE")) {
       Advance();
       stmt.where = ParseWhereClause();
+    }
+    if (AtKeyword("ORDER")) {
+      if (stmt.aggregate)
+        throw std::runtime_error(
+            "ORDER BY ... <-> ... is not supported with and aggregate "
+            "function");
+
+      Advance();
+      ExpectKeyword("BY");
+      KNNSpec knn;
+      knn.column = ExpectIdent();
+      ExpectSymbol("<->");
+      knn.query_vector = ParseVectorLiteral();
+      ExpectKeyword("LIMIT");
+      if (Peek().type != TokenType::NUMBER)
+        throw std::runtime_error("Expected a number after LIMIT, got " +
+                                 Peek().text);
+      knn.k = static_cast<uint32_t>(std::stoul(Advance().text));
+      stmt.knn = knn;
     }
     if (AtSymbol(";")) Advance();
     return stmt;
@@ -261,12 +394,13 @@ class Parser {
       : tokens(std::move(tokens)), pos(0) {}
   Statement Parse() {
     std::string kw = Upper(Peek().text);
-    if (kw == "CREATE") return ParseCreateTable();
+    if (kw == "CREATE") return ParseCreate();
+    if (kw == "REFRESH") return ParseRefreshColumnar();
     if (kw == "INSERT") return ParseInsert();
     if (kw == "SELECT") return ParseSelect();
     if (kw == "DELETE") return ParseDelete();
     throw std::runtime_error(
-        "Parse: Expected CREATE, INSERT, SELECT, or DELETE, got " +
+        "Parse: Expected CREATE, REFRESH, INSERT, SELECT, or DELETE, got " +
         Peek().text);
   }
 };

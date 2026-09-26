@@ -5,11 +5,12 @@
 #include <vector>
 
 namespace minidb {
-enum class ColumnType : uint8_t { INTEGER = 1, TEXT };
+enum class ColumnType : uint8_t { INTEGER = 1, TEXT, VECTOR };
 
 struct Column {
   std::string name;
   ColumnType type;
+  uint32_t dim = 0;
 };
 
 struct Schema {
@@ -26,6 +27,7 @@ struct Value {
   ColumnType type = ColumnType::INTEGER;
   int64_t int_val = 0;
   std::string text_val;
+  std::vector<float> vector_val;
 
   static Value Int(int64_t v) {
     Value r;
@@ -41,12 +43,36 @@ struct Value {
     return r;
   }
 
+  static Value Vector(std::vector<float> v) {
+    Value r;
+    r.type = ColumnType::VECTOR;
+    r.vector_val = std::move(v);
+    return r;
+  }
+
   std::string ToString() const {
-    return type == ColumnType::INTEGER ? std::to_string(int_val) : text_val;
+    if (type == ColumnType::INTEGER)
+      return std::to_string(int_val);
+    else if (type == ColumnType::TEXT)
+      return text_val;
+    std::string s = "[";
+    for (size_t i = 0; i < vector_val.size(); ++i) {
+      if (i) s += ",";
+      if (i >= 4) {
+        s += "...";
+        break;
+      }
+      s += std::to_string(vector_val[i]);
+    }
+    s += "] (" + std::to_string(vector_val.size()) + "d)";
+    return s;
   }
 };
 std::vector<char> SerializeRow(const Schema& schema,
                                const std::vector<Value>& values);
 std::vector<Value> DeserializeRow(const Schema& schema,
                                   const std::vector<char>& bytes);
+
+float SquaredL2Distance(const std::vector<float>& a,
+                        const std::vector<float>& b);
 }  // namespace minidb

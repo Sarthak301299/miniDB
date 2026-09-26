@@ -25,13 +25,22 @@ std::vector<char> SerializeRow(const Schema& schema,
       const char* start = reinterpret_cast<const char*>(&values[i].int_val);
       const char* end = start + sizeof(values[i].int_val);
       out.insert(out.end(), start, end);
-    } else {
+    } else if (schema.columns[i].type == ColumnType::TEXT) {
       uint32_t str_len = static_cast<uint32_t>(values[i].text_val.size());
       const char* start = reinterpret_cast<const char*>(&str_len);
       const char* end = start + sizeof(str_len);
       out.insert(out.end(), start, end);
       out.insert(out.end(), values[i].text_val.begin(),
                  values[i].text_val.end());
+    } else {
+      if (values[i].vector_val.size() != schema.columns[i].dim)
+        throw std::runtime_error(
+            "SerializeRow: column " + schema.columns[i].name +
+            " expects dimension " + std::to_string(schema.columns[i].dim) +
+            ", got " + std::to_string(values[i].vector_val.size()));
+      const char* p =
+          reinterpret_cast<const char*>(values[i].vector_val.data());
+      out.insert(out.end(), p, p + sizeof(float) * schema.columns[i].dim);
     }
   }
   return out;
@@ -50,7 +59,7 @@ std::vector<Value> DeserializeRow(const Schema& schema,
       offset += sizeof(extract);
       Value v = Value::Int(extract);
       out.push_back(v);
-    } else {
+    } else if (column.type == ColumnType::TEXT) {
       if (offset + sizeof(uint32_t) > bytes.size())
         throw std::runtime_error(
             "DeserializeRow: buffer too short for text length of column " +
@@ -67,8 +76,35 @@ std::vector<Value> DeserializeRow(const Schema& schema,
       offset += static_cast<size_t>(str_len);
       Value v = Value::Text(extract);
       out.push_back(v);
+    } else {
+      size_t nbytes = sizeof(float) * static_cast<size_t>(column.dim);
+      if (offset + nbytes > bytes.size())
+        throw std::runtime_error(
+            "DeserializeRow: buffer too short for vector of length " +
+            std::to_string(column.dim) + " of column " + column.name);
+
+      std::vector<float> extract(column.dim);
+      std::memcpy(extract.data(), bytes.data() + offset, nbytes);
+      offset += nbytes;
+      Value v = Value::Vector(std::move(extract));
+      out.push_back(v);
     }
   }
   return out;
 }
+
+float SquaredL2Distance(const std::vector<float>& a,
+                        const std::vector<float>& b) {
+  if (a.size() != b.size())
+    throw std::runtime_error(
+        "SquaredL2Distance: The input vectors have different sizes" +
+        std::to_string(a.size()) + " vs. " + std::to_string(b.size()));
+  float out = 0.0f;
+  for (size_t i = 0; i < a.size(); ++i) {
+    float d = (a[i] - b[i]);
+    out += d * d;
+  }
+  return out;
+}
+
 }  // namespace minidb

@@ -22,12 +22,27 @@ class Engine {
   BufferPool* pool;
   WALManager* wal;
   Catalog catalog;
+
+  std::pair<std::unique_ptr<Executor>, std::string> BuildScanPlan(
+      const SelectStmt& stmt, const Schema* schema, HeapFile* heap,
+      TxnId reader_txn, const TransactionManager& txn_mgr);
   QueryResult ExecuteCreateTable(const CreateTableStmt& stmt);
+  QueryResult ExecuteCreateIndex(const CreateIndexStmt& stmt);
+  QueryResult ExecuteCreateVectorIndex(const CreateVectorIndexStmt& stmt);
+  QueryResult ExecuteRefreshColumnar(const RefreshColumnarStmt& stmt,
+                                     const TransactionManager& txn_mgr);
   QueryResult ExecuteInsert(const InsertStmt& stmt, Transaction* txn);
   QueryResult ExecuteSelect(const SelectStmt& stmt, Transaction* txn,
                             const TransactionManager& txn_mgr);
   QueryResult ExecuteDelete(const DeleteStmt& stmt, Transaction* txn,
                             const TransactionManager& txn_mgr);
+  QueryResult ExecuteAggregate(const AggregateSpec& agg, const SelectStmt& stmt,
+                               const Schema* schema, HeapFile* heap,
+                               TxnId reader_txn,
+                               const TransactionManager& txn_mgr);
+  QueryResult ExecuteKNN(const KNNSpec& knn, const SelectStmt& stmt,
+                         const Schema* schema, HeapFile* heap, TxnId reader_txn,
+                         const TransactionManager& txn_mgr);
 
  public:
   Engine(DiskManager* disk, BufferPool* pool, WALManager* wal);
