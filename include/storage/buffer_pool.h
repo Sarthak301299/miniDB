@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <list>
 #include <memory>
 #include <unordered_map>
@@ -14,6 +15,7 @@ struct Frame {
   PageId page_id = INVALID_PAGE_ID;
   int pin_count = 0;
   bool is_dirty = false;
+  bool stale = false;
 };
 
 struct Shard {
@@ -33,6 +35,8 @@ class BufferPool {
   DiskManager* disk;
   WALManager* wal;
   std::vector<std::unique_ptr<Shard>> shards;
+  std::function<void(PageId)> pre_disk_read_hook;
+  std::function<void(PageId, LSN)> post_disk_read_hook;
 
  public:
   BufferPool(size_t pool_size, DiskManager* disk, WALManager* wal,
@@ -41,6 +45,13 @@ class BufferPool {
   Page* NewPage(PageId* out_page_id);
   void UnpinPage(PageId page_id, bool is_dirty);
   void FlushPage(PageId page_id);
+  void InvalidatePage(PageId page_id);
   LSN Checkpoint();
+  void SetPreDiskReadHook(std::function<void(PageId)> hook) {
+    pre_disk_read_hook = std::move(hook);
+  }
+  void SetPostDiskReadHook(std::function<void(PageId, LSN)> hook) {
+    post_disk_read_hook = std::move(hook);
+  }
 };
 }  // namespace minidb

@@ -30,6 +30,7 @@ class WALManager {
  private:
   std::string file_name;
   int fd = -1;
+  bool read_only;
   std::mutex buffer_latch;
   std::mutex write_latch;
   LSN next_lsn = 1;
@@ -37,11 +38,13 @@ class WALManager {
   std::vector<std::vector<char>> buffer;
 
  public:
-  explicit WALManager(const std::string& log_file);
+  explicit WALManager(const std::string& log_file, bool read_only = false);
   ~WALManager();
   LSN Append(WALRecord record);
   void Flush(LSN upto = INVALID_LSN);
   std::vector<WALRecord> ReadAll();
+  std::vector<WALRecord> ReadAll(long start_offset, long* out_end_offset);
   LSN FlushedLSN() const;
+  bool IsReadOnly() const { return read_only; }
 };
 }  // namespace minidb

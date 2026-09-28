@@ -709,13 +709,13 @@ int main() {
     constexpr uint32_t kEvalK = 10;
     auto exact_ids = BruteForceKNN(ground_truth_data, query, kEvalK);
 
-    IVFIndex* raw_index = engine.GetCatalog().GetVectorIndex("embeddings", "v");
+    auto raw_index = engine.GetCatalog().GetVectorIndex("embeddings", "v");
     std::cout << "nprobe : recall@" << kEvalK << "\n";
     for (uint32_t nprobe : {1u, 2u, 4u, 8u, 20u}) {
       auto approx_rids = raw_index->Search(query, kEvalK, nprobe);
       std::vector<int64_t> approx_ids;
       for (auto& rid : approx_rids) {
-        HeapFile* heap = engine.GetCatalog().GetHeap("embeddings");
+        auto heap = engine.GetCatalog().GetHeap("embeddings");
         TupleHeader hdr;
         std::vector<char> bytes;
         if (heap->ReadTuple(rid, &hdr, &bytes)) {

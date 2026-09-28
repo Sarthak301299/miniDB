@@ -41,6 +41,12 @@ void TransactionManager::Commit(Transaction* txn) {
   }
   txn->state = Transaction::State::COMMITTED;
 }
+
+void TransactionManager::ObserveCommit(TxnId txn_id) {
+  std::lock_guard<std::mutex> lock(latch);
+  committed_ids.insert(txn_id);
+}
+
 void TransactionManager::Abort(Transaction* txn) {
   WALRecord record;
   record.type = WALRecordType::ABORT;

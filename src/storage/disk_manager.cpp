@@ -9,8 +9,10 @@
 #include <stdexcept>
 
 namespace minidb {
-DiskManager::DiskManager(const std::string& db_file) : file_name(db_file) {
-  fd = ::open(db_file.c_str(), O_RDWR | O_CREAT, 0644);
+DiskManager::DiskManager(const std::string& db_file, bool read_only)
+    : file_name(db_file), read_only(read_only) {
+  int flags = read_only ? O_RDONLY : (O_RDWR | O_CREAT);
+  fd = ::open(db_file.c_str(), flags, 0644);
   if (fd < 0) {
     throw std::runtime_error("DiskManager: failed to open db file " + db_file +
                              " : " + std::string(std::strerror(errno)));
@@ -43,6 +45,9 @@ void DiskManager::ReadPage(PageId page_id, char* out) {
 }
 
 void DiskManager::WritePage(PageId page_id, const char* data) {
+  if (read_only)
+    throw std::runtime_error(
+        "DiskManager: WritePage called on a read-only instance");
   off_t offset = static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE);
   ssize_t n = ::pwrite(fd, data, PAGE_SIZE, offset);
   if (n < 0 || static_cast<size_t>(n) != PAGE_SIZE) {
@@ -52,6 +57,9 @@ void DiskManager::WritePage(PageId page_id, const char* data) {
 }
 
 PageId DiskManager::AllocatePage() {
+  if (read_only)
+    throw std::runtime_error(
+        "DiskManager: AllocatePage called on a read-only instance");
   return next_page_id.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -65,6 +73,9 @@ void DiskManager::AdvancePastPage(PageId page_id) {
 }
 
 void DiskManager::Sync() {
+  if (read_only)
+    throw std::runtime_error(
+        "DiskManager: Sync called on a read-only instance");
   if (::fsync(fd) != 0) {
     throw std::runtime_error("DiskManager: fsync failed : " +
                              std::string(std::strerror(errno)));

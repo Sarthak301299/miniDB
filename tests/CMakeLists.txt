@@ -1,3 +1,4 @@
 add_subdirectory(storage)
 add_subdirectory(transaction)
 add_subdirectory(query)
+add_subdirectory(distributed)

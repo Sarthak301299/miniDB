@@ -256,6 +256,15 @@ void Catalog::LoadFromDisk() {
   }
 }
 
+void Catalog::ReloadFromDisk() {
+  std::lock_guard<std::mutex> lock(latch);
+  pool->InvalidatePage(catalogPageId);
+  tables.clear();
+  indexes.clear();
+  vector_indexes.clear();
+  LoadFromDisk();
+}
+
 void Catalog::WireHeapCallback(HeapFile* heap) {
   heap->SetOnNewPageCallback([this](PageId) { this->Persist(); });
 }
@@ -328,7 +337,6 @@ void Catalog::PersistLocked() {
   record.after_image.assign(base, base + Page::UsableSize());
   LSN lsn = wal->Append(record);
   page->SetLSN(lsn);
-  wal->Flush(lsn);
   pool->UnpinPage(catalogPageId, true);
 }
 
@@ -346,8 +354,8 @@ bool Catalog::CreateTable(const std::string& name, const Schema& schema) {
 
 bool Catalog::CreateIndex(const std::string& index_name,
                           const std::string& table, const std::string& column) {
-  HeapFile* heap = nullptr;
-  const Schema* schema = nullptr;
+  std::shared_ptr<HeapFile> heap;
+  Schema schema;
   {
     std::lock_guard<std::mutex> lock(latch);
     if (indexes.contains(index_name)) return false;
@@ -358,13 +366,13 @@ bool Catalog::CreateIndex(const std::string& index_name,
         it->second.schema.columns[static_cast<size_t>(col_idx)].type !=
             ColumnType::INTEGER)
       return false;
-    heap = it->second.heap.get();
-    schema = &it->second.schema;
+    heap = it->second.heap;
+    schema = it->second.schema;
   }
-  int col_idx = schema->ColumnIndex(column);
-  auto tree = std::make_unique<BPlusTree>(pool, wal);
+  int col_idx = schema.ColumnIndex(column);
+  auto tree = std::make_shared<BPlusTree>(pool, wal);
   for (const auto& [rid, bytes] : heap->ScanAllPhysical()) {
-    auto values = DeserializeRow(*schema, bytes);
+    auto values = DeserializeRow(schema, bytes);
     tree->Insert(values[static_cast<size_t>(col_idx)].int_val, rid);
   }
   std::lock_guard<std::mutex> lock(latch);
@@ -379,22 +387,18 @@ bool Catalog::CreateIndex(const std::string& index_name,
   return true;
 }
 
-HeapFile* Catalog::GetHeap(const std::string& name) {
+std::shared_ptr<HeapFile> Catalog::GetHeap(const std::string& name) {
   std::lock_guard<std::mutex> lock(latch);
   auto it = tables.find(name);
-  if (it != tables.end())
-    return it->second.heap.get();
-  else
-    return nullptr;
+  if (it != tables.end()) return it->second.heap;
+  return nullptr;
 }
 
-const Schema* Catalog::GetSchema(const std::string& name) {
+std::optional<Schema> Catalog::GetSchema(const std::string& name) {
   std::lock_guard<std::mutex> lock(latch);
   auto it = tables.find(name);
-  if (it != tables.end())
-    return &it->second.schema;
-  else
-    return nullptr;
+  if (it != tables.end()) return it->second.schema;
+  return std::nullopt;
 }
 
 bool Catalog::HasTable(const std::string& name) const {
@@ -402,48 +406,48 @@ bool Catalog::HasTable(const std::string& name) const {
   return tables.contains(name);
 }
 
-BPlusTree* Catalog::GetIndex(const std::string& table,
-                             const std::string& column) {
+std::shared_ptr<BPlusTree> Catalog::GetIndex(const std::string& table,
+                                             const std::string& column) {
   std::lock_guard<std::mutex> lock(latch);
   for (const auto& [name, info] : indexes) {
-    if (info.table == table && info.column == column) return info.tree.get();
+    if (info.table == table && info.column == column) return info.tree;
   }
   return nullptr;
 }
 
-std::vector<std::pair<std::string, BPlusTree*>> Catalog::GetIndexesForTable(
-    const std::string& table) {
+std::vector<std::pair<std::string, std::shared_ptr<BPlusTree>>>
+Catalog::GetIndexesForTable(const std::string& table) {
   std::lock_guard<std::mutex> lock(latch);
-  std::vector<std::pair<std::string, BPlusTree*>> out;
+  std::vector<std::pair<std::string, std::shared_ptr<BPlusTree>>> out;
   for (const auto& [name, info] : indexes) {
-    if (info.table == table) out.push_back({info.column, info.tree.get()});
+    if (info.table == table) out.push_back({info.column, info.tree});
   }
   return out;
 }
 
 void Catalog::RefreshColumnStore(const std::string& table,
                                  const TransactionManager& txn_mgr) {
-  HeapFile* heap = nullptr;
+  std::shared_ptr<HeapFile> heap;
   Schema schema;
-  ColumnStore* store = nullptr;
+  std::shared_ptr<ColumnStore> store;
   {
     std::lock_guard<std::mutex> lock(latch);
     auto it = tables.find(table);
     if (it == tables.end()) throw std::runtime_error("Unknown table " + table);
     if (!it->second.column_store) {
-      it->second.column_store = std::make_unique<ColumnStore>();
+      it->second.column_store = std::make_shared<ColumnStore>();
     }
-    heap = it->second.heap.get();
+    heap = it->second.heap;
     schema = it->second.schema;
-    store = it->second.column_store.get();
+    store = it->second.column_store;
   }
-  store->Refresh(heap, schema, txn_mgr);
+  store->Refresh(heap.get(), schema, txn_mgr);
 }
 
-ColumnStore* Catalog::GetColumnStore(const std::string& table) {
+std::shared_ptr<ColumnStore> Catalog::GetColumnStore(const std::string& table) {
   std::lock_guard<std::mutex> lock(latch);
   auto it = tables.find(table);
-  if (it != tables.end()) return it->second.column_store.get();
+  if (it != tables.end()) return it->second.column_store;
   return nullptr;
 }
 
@@ -451,8 +455,8 @@ bool Catalog::CreateVectorIndex(const std::string& index_name,
                                 const std::string& table,
                                 const std::string& column,
                                 uint32_t num_clusters) {
-  HeapFile* heap = nullptr;
-  const Schema* schema = nullptr;
+  std::shared_ptr<HeapFile> heap;
+  Schema schema;
   uint32_t dim = 0;
   {
     std::lock_guard<std::mutex> lock(latch);
@@ -464,18 +468,18 @@ bool Catalog::CreateVectorIndex(const std::string& index_name,
         it->second.schema.columns[static_cast<size_t>(col_idx)].type !=
             ColumnType::VECTOR)
       return false;
-    heap = it->second.heap.get();
-    schema = &it->second.schema;
+    heap = it->second.heap;
+    schema = it->second.schema;
     dim = it->second.schema.columns[static_cast<size_t>(col_idx)].dim;
   }
-  int col_idx = schema->ColumnIndex(column);
+  int col_idx = schema.ColumnIndex(column);
   std::vector<std::pair<std::vector<float>, RID>> vectors;
   for (const auto& [rid, bytes] : heap->ScanAllPhysical()) {
-    auto values = DeserializeRow(*schema, bytes);
+    auto values = DeserializeRow(schema, bytes);
     vectors.push_back({values[static_cast<size_t>(col_idx)].vector_val, rid});
   }
   auto index =
-      std::make_unique<IVFIndex>(pool, wal, dim, num_clusters, vectors);
+      std::make_shared<IVFIndex>(pool, wal, dim, num_clusters, vectors);
   std::lock_guard<std::mutex> lock(latch);
   if (vector_indexes.contains(index_name)) return false;
   WireVectorIndexCallback(index.get());
@@ -488,21 +492,21 @@ bool Catalog::CreateVectorIndex(const std::string& index_name,
   return true;
 }
 
-IVFIndex* Catalog::GetVectorIndex(const std::string& table,
-                                  const std::string& column) {
+std::shared_ptr<IVFIndex> Catalog::GetVectorIndex(const std::string& table,
+                                                  const std::string& column) {
   std::lock_guard<std::mutex> lock(latch);
   for (const auto& [name, info] : vector_indexes) {
-    if (info.table == table && info.column == column) return info.index.get();
+    if (info.table == table && info.column == column) return info.index;
   }
   return nullptr;
 }
 
-std::vector<std::pair<std::string, IVFIndex*>>
+std::vector<std::pair<std::string, std::shared_ptr<IVFIndex>>>
 Catalog::GetVectorIndexesForTable(const std::string& table) {
   std::lock_guard<std::mutex> lock(latch);
-  std::vector<std::pair<std::string, IVFIndex*>> out;
+  std::vector<std::pair<std::string, std::shared_ptr<IVFIndex>>> out;
   for (const auto& [name, info] : vector_indexes) {
-    if (info.table == table) out.push_back({info.column, info.index.get()});
+    if (info.table == table) out.push_back({info.column, info.index});
   }
   return out;
 }

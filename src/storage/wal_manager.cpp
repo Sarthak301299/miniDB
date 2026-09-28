@@ -68,8 +68,10 @@ WALRecord WALRecord::Deserialize(const char* buf, size_t len) {
   return r;
 }
 
-WALManager::WALManager(const std::string& log_file) : file_name(log_file) {
-  fd = ::open(log_file.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
+WALManager::WALManager(const std::string& log_file, bool read_only)
+    : file_name(log_file), read_only(read_only) {
+  int flags = read_only ? O_RDONLY : (O_RDWR | O_CREAT | O_APPEND);
+  fd = ::open(log_file.c_str(), flags, 0644);
   if (fd < 0) {
     throw std::runtime_error("WALManager: open failed for " + log_file + " : " +
                              std::string(std::strerror(errno)));
@@ -82,11 +84,14 @@ WALManager::WALManager(const std::string& log_file) : file_name(log_file) {
 }
 
 WALManager::~WALManager() {
-  Flush();
+  if (!read_only) Flush();
   if (fd >= 0) ::close(fd);
 }
 
 LSN WALManager::Append(WALRecord record) {
+  if (read_only)
+    throw std::runtime_error(
+        "WALManager: Append called on a read-only instance");
   std::lock_guard<std::mutex> lock(buffer_latch);
   record.lsn = next_lsn++;
   buffer.push_back(record.Serialize());
@@ -94,6 +99,9 @@ LSN WALManager::Append(WALRecord record) {
 }
 
 void WALManager::Flush(LSN upto) {
+  if (read_only)
+    throw std::runtime_error(
+        "WALManager: Flush called on a read-only instance");
   std::lock_guard<std::mutex> write_lock(write_latch);
   std::vector<std::vector<char>> to_write;
   {
@@ -129,10 +137,18 @@ void WALManager::Flush(LSN upto) {
   flushed_lsn.store(last_written);
 }
 
-std::vector<WALRecord> WALManager::ReadAll() {
+std::vector<WALRecord> WALManager::ReadAll() { return ReadAll(0, nullptr); }
+
+std::vector<WALRecord> WALManager::ReadAll(long start_offset,
+                                           long* out_end_offset) {
   std::vector<WALRecord> records;
   int rfd = ::open(file_name.c_str(), O_RDONLY);
-  if (rfd < 0) return records;
+  if (rfd < 0) {
+    if (out_end_offset) *out_end_offset = start_offset;
+    return records;
+  }
+  if (start_offset > 0) ::lseek(rfd, start_offset, SEEK_SET);
+  long pos = start_offset;
   while (true) {
     uint32_t len = 0;
     ssize_t n = ::read(rfd, &len, sizeof(len));
@@ -147,8 +163,10 @@ std::vector<WALRecord> WALManager::ReadAll() {
     } catch (const std::exception&) {
       break;
     }
+    pos += static_cast<long>(sizeof(len)) + static_cast<long>(len);
   }
   ::close(rfd);
+  if (out_end_offset) *out_end_offset = pos;
   return records;
 }
 

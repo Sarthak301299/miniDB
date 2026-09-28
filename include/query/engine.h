@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include "catalog.h"
@@ -23,9 +25,9 @@ class Engine {
   WALManager* wal;
   Catalog catalog;
 
-  std::pair<std::unique_ptr<Executor>, std::string> BuildScanPlan(
-      const SelectStmt& stmt, const Schema* schema, HeapFile* heap,
-      TxnId reader_txn, const TransactionManager& txn_mgr);
+  std::tuple<std::unique_ptr<Executor>, std::string, std::shared_ptr<BPlusTree>>
+  BuildScanPlan(const SelectStmt& stmt, const Schema* schema, HeapFile* heap,
+                TxnId reader_txn, const TransactionManager& txn_mgr);
   QueryResult ExecuteCreateTable(const CreateTableStmt& stmt);
   QueryResult ExecuteCreateIndex(const CreateIndexStmt& stmt);
   QueryResult ExecuteCreateVectorIndex(const CreateVectorIndexStmt& stmt);

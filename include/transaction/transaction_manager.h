@@ -23,6 +23,7 @@ class TransactionManager {
   void Commit(Transaction* txn);
   void Abort(Transaction* txn);
   bool isCommitted(TxnId txn_id) const;
+  void ObserveCommit(TxnId txn_id);
   bool isVisible(const TupleHeader& header, TxnId txn_id) const;
 };
 }  // namespace minidb

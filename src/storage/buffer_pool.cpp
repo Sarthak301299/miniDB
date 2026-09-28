@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace minidb {
@@ -59,13 +60,22 @@ Page* BufferPool::FetchPage(PageId page_id) {
   std::lock_guard<std::mutex> lock(shard.latch);
   if (Frame* f = FindFrameInShard(shard, page_id)) {
     size_t idx = static_cast<size_t>(f - &shard.frames[0]);
+    if (f->stale && f->pin_count == 0) {
+      if (pre_disk_read_hook) pre_disk_read_hook(page_id);
+      disk->ReadPage(page_id, f->page.GetData());
+      if (post_disk_read_hook) post_disk_read_hook(page_id, f->page.GetLSN());
+      f->stale = false;
+      f->is_dirty = false;
+    }
     f->pin_count++;
     shard.lru.erase(shard.lru_pos[idx]);
     shard.lru_pos[idx] = shard.lru.insert(shard.lru.begin(), idx);
     return &(f->page);
   }
   Frame* f = EvictFrameInShard(shard);
+  if (pre_disk_read_hook) pre_disk_read_hook(page_id);
   disk->ReadPage(page_id, f->page.GetData());
+  if (post_disk_read_hook) post_disk_read_hook(page_id, f->page.GetLSN());
   f->page_id = page_id;
   f->pin_count = 1;
   f->is_dirty = false;
@@ -103,13 +113,30 @@ void BufferPool::UnpinPage(PageId page_id, bool is_dirty) {
 
 void BufferPool::FlushPage(PageId page_id) {
   Shard& shard = *shards[ShardFor(page_id)];
+  for (int attempt = 0; attempt < 200000; ++attempt) {
+    {
+      std::lock_guard<std::mutex> lock(shard.latch);
+      Frame* f = FindFrameInShard(shard, page_id);
+      if (!f || !f->is_dirty) return;
+      if (f->pin_count == 0) {
+        wal->Flush(f->page.GetLSN());
+        disk->WritePage(page_id, f->page.GetData());
+        f->is_dirty = false;
+        return;
+      }
+    }
+    std::this_thread::yield();
+  }
+  throw std::runtime_error(
+      "BufferPool::FlushPage: page " + std::to_string(page_id) +
+      " stayed pinned; refusing to write a possibly mid-modification image");
+}
+
+void BufferPool::InvalidatePage(PageId page_id) {
+  Shard& shard = *shards[ShardFor(page_id)];
   std::lock_guard<std::mutex> lock(shard.latch);
   if (Frame* f = FindFrameInShard(shard, page_id)) {
-    if (f && f->is_dirty) {
-      wal->Flush(f->page.GetLSN());
-      disk->WritePage(page_id, f->page.GetData());
-      f->is_dirty = false;
-    }
+    f->stale = true;
   }
 }
 

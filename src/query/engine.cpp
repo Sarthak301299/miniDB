@@ -55,10 +55,11 @@ QueryResult Engine::ExecuteInsert(const InsertStmt& stmt, Transaction* txn) {
   if (!txn)
     throw std::runtime_error(
         "ExecuteInsert: INSERT requires an active transaction");
-  const Schema* schema = catalog.GetSchema(stmt.table);
-  if (!schema)
+  auto schema_opt = catalog.GetSchema(stmt.table);
+  if (!schema_opt)
     throw std::runtime_error("ExecuteInsert: Unknown table " + stmt.table);
-  HeapFile* heap = catalog.GetHeap(stmt.table);
+  const Schema* schema = &*schema_opt;
+  auto heap = catalog.GetHeap(stmt.table);
   auto bytes = SerializeRow(*schema, stmt.values);
   RID rid = heap->InsertTuple(txn, bytes);
   for (const auto& [column, tree] : catalog.GetIndexesForTable(stmt.table)) {
@@ -75,15 +76,16 @@ QueryResult Engine::ExecuteInsert(const InsertStmt& stmt, Transaction* txn) {
   return result;
 }
 
-std::pair<std::unique_ptr<Executor>, std::string> Engine::BuildScanPlan(
-    const SelectStmt& stmt, const Schema* schema, HeapFile* heap,
-    TxnId reader_txn, const TransactionManager& txn_mgr) {
-  BPlusTree* index = nullptr;
+std::tuple<std::unique_ptr<Executor>, std::string, std::shared_ptr<BPlusTree>>
+Engine::BuildScanPlan(const SelectStmt& stmt, const Schema* schema,
+                      HeapFile* heap, TxnId reader_txn,
+                      const TransactionManager& txn_mgr) {
+  std::shared_ptr<BPlusTree> index;
   Predicate indexed_pred;
   std::vector<Predicate> remaining_preds;
   for (auto& pred : stmt.where) {
     if (!index && pred.op == "=" && pred.value.type == ColumnType::INTEGER) {
-      if (BPlusTree* t = catalog.GetIndex(stmt.table, pred.column)) {
+      if (auto t = catalog.GetIndex(stmt.table, pred.column)) {
         index = t;
         indexed_pred = pred;
         continue;
@@ -96,8 +98,9 @@ std::pair<std::unique_ptr<Executor>, std::string> Engine::BuildScanPlan(
   if (index) {
     explain = "IndexScan(" + stmt.table + "." + indexed_pred.column + " = " +
               indexed_pred.value.ToString() + ")";
-    plan = std::make_unique<IndexScanExecutor>(
-        index, indexed_pred.value.int_val, heap, schema, reader_txn, &txn_mgr);
+    plan = std::make_unique<IndexScanExecutor>(index.get(),
+                                               indexed_pred.value.int_val, heap,
+                                               schema, reader_txn, &txn_mgr);
   } else {
     explain = "SeqScan(" + stmt.table + ") [no matching index -> full scan]";
     plan =
@@ -106,10 +109,10 @@ std::pair<std::unique_ptr<Executor>, std::string> Engine::BuildScanPlan(
   if (!remaining_preds.empty()) {
     explain = "Filter(" + std::to_string(stmt.where.size()) +
               " predicates)\n " + explain;
-    plan =
-        std::make_unique<FilterExecutor>(std::move(plan), schema, stmt.where);
+    plan = std::make_unique<FilterExecutor>(std::move(plan), schema,
+                                            remaining_preds);
   }
-  return {std::move(plan), explain};
+  return {std::move(plan), explain, index};
 }
 
 QueryResult Engine::ExecuteAggregate(const AggregateSpec& agg,
@@ -130,7 +133,7 @@ QueryResult Engine::ExecuteAggregate(const AggregateSpec& agg,
   QueryResult result;
   result.is_select = true;
   result.column_names = {agg.func + "(" + agg.column + ")"};
-  ColumnStore* cs = catalog.GetColumnStore(stmt.table);
+  auto cs = catalog.GetColumnStore(stmt.table);
   bool use_columnar = stmt.where.empty() && cs != nullptr &&
                       (agg.func == "COUNT" || cs->HasColumn(agg.column));
   if (use_columnar) {
@@ -159,7 +162,7 @@ QueryResult Engine::ExecuteAggregate(const AggregateSpec& agg,
     result.rows.push_back({v});
     return result;
   }
-  auto [plan, plan_explain] =
+  auto [plan, plan_explain, index_keepalive] =
       BuildScanPlan(stmt, schema, heap, reader_txn, txn_mgr);
   result.explain =
       "RowAggregate(" + agg.func + "(" + agg.column + "))\n " + plan_explain;
@@ -208,7 +211,7 @@ QueryResult Engine::ExecuteKNN(const KNNSpec& knn, const SelectStmt& stmt,
                                const Schema* schema, HeapFile* heap,
                                TxnId reader_txn,
                                const TransactionManager& txn_mgr) {
-  IVFIndex* index = catalog.GetVectorIndex(stmt.table, knn.column);
+  auto index = catalog.GetVectorIndex(stmt.table, knn.column);
   if (!index)
     throw std::runtime_error("No vector index on " + stmt.table + "." +
                              knn.column);
@@ -262,22 +265,23 @@ QueryResult Engine::ExecuteKNN(const KNNSpec& knn, const SelectStmt& stmt,
 
 QueryResult Engine::ExecuteSelect(const SelectStmt& stmt, Transaction* txn,
                                   const TransactionManager& txn_mgr) {
-  const Schema* schema = catalog.GetSchema(stmt.table);
-  if (!schema)
+  auto schema_opt = catalog.GetSchema(stmt.table);
+  if (!schema_opt)
     throw std::runtime_error("ExecuteSelect: Unknown table " + stmt.table);
-  HeapFile* heap = catalog.GetHeap(stmt.table);
+  const Schema* schema = &*schema_opt;
+  auto heap = catalog.GetHeap(stmt.table);
   TxnId reader_txn = txn ? txn->id : INVALID_TXN_ID;
 
   if (stmt.aggregate) {
-    return ExecuteAggregate(*stmt.aggregate, stmt, schema, heap, reader_txn,
-                            txn_mgr);
+    return ExecuteAggregate(*stmt.aggregate, stmt, schema, heap.get(),
+                            reader_txn, txn_mgr);
   }
   if (stmt.knn) {
-    return ExecuteKNN(*stmt.knn, stmt, schema, heap, reader_txn, txn_mgr);
+    return ExecuteKNN(*stmt.knn, stmt, schema, heap.get(), reader_txn, txn_mgr);
   }
 
-  auto [plan, base_explain] =
-      BuildScanPlan(stmt, schema, heap, reader_txn, txn_mgr);
+  auto [plan, base_explain, index_keepalive] =
+      BuildScanPlan(stmt, schema, heap.get(), reader_txn, txn_mgr);
   std::vector<std::string> out_columns = stmt.columns;
   if (out_columns.empty())
     for (const auto& c : schema->columns) out_columns.push_back(c.name);
@@ -301,10 +305,11 @@ QueryResult Engine::ExecuteDelete(const DeleteStmt& stmt, Transaction* txn,
   if (!txn)
     throw std::runtime_error(
         "ExecuteDelete: DELETE requires an active transaction");
-  const Schema* schema = catalog.GetSchema(stmt.table);
-  if (!schema)
+  auto schema_opt = catalog.GetSchema(stmt.table);
+  if (!schema_opt)
     throw std::runtime_error("ExecuteSelect: Unknown table " + stmt.table);
-  HeapFile* heap = catalog.GetHeap(stmt.table);
+  const Schema* schema = &*schema_opt;
+  auto heap = catalog.GetHeap(stmt.table);
   auto rows = heap->Scan(txn->id, txn_mgr);
   size_t deleted = 0;
   for (const auto& [rid, rawrow] : rows) {
