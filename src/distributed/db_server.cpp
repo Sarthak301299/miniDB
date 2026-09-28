@@ -56,6 +56,9 @@ DbServer::DbServer(int id, std::string data_dir_, int num_threads,
   wal_path = data_dir + "/log_file.wal";
   lock_path = data_dir + "/primary.lock";
 
+  if (const char* m = std::getenv("MINIDB_REPLICA_MODE"))
+    wal_mode = (std::strcmp(m, "flush") != 0);
+
   for (size_t i = 0; i < connection_pool_size; ++i) {
     primary_conn_pool.push_back(std::make_unique<net::PersistentConnection>());
   }
@@ -80,13 +83,26 @@ void DbServer::BuildEngineStackLocked(bool read_only) {
   }
   pool = std::make_unique<BufferPool>(128, disk.get(), wal.get(), 8);
   {
-    std::lock_guard<std::mutex> lock(pending_flush_mutex);
-    pending_flush_pages.reserve(1024);
+    std::lock_guard<std::mutex> l(wal_index_mutex);
+    wal_index.clear();
   }
-  pool->SetPreDiskReadHook(
-      [this](PageId page_id) { PreDiskReadHook(page_id); });
-  pool->SetPostDiskReadHook(
-      [this](PageId page_id, LSN lsn) { PostDiskReadHook(page_id, lsn); });
+  if (wal_mode && read_only) {
+    std::vector<long> offsets;
+    long end = 0;
+    auto recs = wal->ReadAll(0, &end, &offsets);
+    IndexWALRecords(recs, offsets);
+    pool->SetPageProvider(
+        [this](PageId pid, Page* page) { return WALPageProvider(pid, page); });
+  } else {
+    {
+      std::lock_guard<std::mutex> lock(pending_flush_mutex);
+      pending_flush_pages.reserve(1024);
+    }
+    pool->SetPreDiskReadHook(
+        [this](PageId page_id) { PreDiskReadHook(page_id); });
+    pool->SetPostDiskReadHook(
+        [this](PageId page_id, LSN lsn) { PostDiskReadHook(page_id, lsn); });
+  }
   txn_mgr = std::make_unique<TransactionManager>(wal.get());
   engine = std::make_unique<Engine>(disk.get(), pool.get(), wal.get());
 }
@@ -118,28 +134,70 @@ void DbServer::BecomePrimary(
   epoch.store(epoch_);
   replica_control_addrs = std::move(replica_control_addrs_);
   replica_conns.clear();
-  for (const auto& [host, port] : replica_control_addrs_) {
+  for (const auto& [host, port] : replica_control_addrs) {
     auto conn = std::make_unique<net::PersistentConnection>();
     conn->SetTarget(host, port);
     replica_conns.push_back(std::move(conn));
   }
 }
 
-void DbServer::NotifyReplicasAndWait() {
-  for (size_t i = 0; i < replica_control_addrs.size(); ++i) {
-    std::string resp =
-        replica_conns[i]->SendAndRecv("NOTIFY " + std::to_string(epoch.load()));
-    if (resp.rfind("ACK", 0) != 0) {
+void DbServer::DoNotifyRound() {
+  std::vector<net::PersistentConnection*> conns;
+  conns.reserve(replica_conns.size());
+  for (auto& c : replica_conns) conns.push_back(c.get());
+  std::vector<std::string> replies = net::PersistentConnection::SendAndRecvAll(
+      conns, "NOTIFY " + std::to_string(epoch.load()));
+  for (size_t i = 0; i < replies.size(); ++i) {
+    if (replies[i].rfind("ACK", 0) != 0) {
       auto& [host, port] = replica_control_addrs[i];
       throw std::runtime_error("replication failed: replica at " + host + ":" +
-                               std::to_string(port) + " did not ack (" + resp +
-                               ")");
+                               std::to_string(port) + " did not ack (" +
+                               replies[i] + ")");
     }
+  }
+}
+void DbServer::NotifyReplicasAndWait() {
+  if (replica_control_addrs.empty()) return;
+  notify_calls.fetch_add(1);
+  std::unique_lock<std::mutex> lk(notify_mu);
+  const uint64_t need = notify_rounds_started + 1;
+  while (true) {
+    if (notify_rounds_completed >= need) {
+      const NotifyErr& e = notify_errors[need % notify_err_ring];
+      if (e.round == need && !e.msg.empty()) throw std::runtime_error(e.msg);
+      return;
+    }
+    if (!notify_round_in_flight) {
+      notify_round_in_flight = true;
+      const uint64_t my_round = ++notify_rounds_started;
+      lk.unlock();
+      std::string err;
+      const auto t0 = std::chrono::steady_clock::now();
+      try {
+        DoNotifyRound();
+
+      } catch (const std::exception& ex) {
+        err = ex.what();
+        if (err.empty()) err = "replication failed";
+      }
+      const auto dt = std::chrono::steady_clock::now() - t0;
+      lk.lock();
+      notify_errors[my_round % notify_err_ring] = NotifyErr{my_round, err};
+      notify_rounds_completed = my_round;
+      notify_round_in_flight = false;
+      notify_rounds.fetch_add(1);
+      notify_busy_ns.fetch_add(static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count()));
+      notify_cv.notify_all();
+      continue;  // re-check: this round is >= need, so it returns above
+    }
+    notify_cv.wait(lk);
   }
 }
 
 void DbServer::RequestPrimaryFlushPage(PageId page_id) {
   if (current_primary_control_port < 0) return;
+  flush_requests.fetch_add(1);
   size_t idx = next_primary_conn.fetch_add(1) % primary_conn_pool.size();
   std::string resp = primary_conn_pool[idx]->SendAndRecv(
       "FLUSHPAGE " + std::to_string(page_id));
@@ -152,7 +210,9 @@ void DbServer::RequestPrimaryFlushPage(PageId page_id) {
 
 void DbServer::SyncFromSharedWal() {
   long new_offset;
-  auto new_records = wal->ReadAll(last_synced_offset.load(), &new_offset);
+  std::vector<long> new_offsets;
+  auto new_records =
+      wal->ReadAll(last_synced_offset.load(), &new_offset, &new_offsets);
   if (new_records.empty()) {
     last_synced_offset = new_offset;
     return;
@@ -171,7 +231,9 @@ void DbServer::SyncFromSharedWal() {
     }
   }
 
-  {
+  if (wal_mode) {
+    IndexWALRecords(new_records, new_offsets);
+  } else {
     std::lock_guard<std::mutex> lock(pending_flush_mutex);
     for (PageId pid : touched_pages) pending_flush_pages.insert(pid);
   }
@@ -186,7 +248,7 @@ void DbServer::SyncFromSharedWal() {
 }
 
 void DbServer::PreDiskReadHook(PageId page_id) {
-  if (is_primary.load()) return;
+  if (wal_mode || is_primary.load()) return;
   bool needs_flush;
   {
     std::lock_guard<std::mutex> lock(pending_flush_mutex);
@@ -215,6 +277,54 @@ void DbServer::PostDiskReadHook(PageId page_id, LSN page_lsn) {
   }
   mark_offset = end;
   mark_max_lsn.store(max_lsn);
+}
+
+void DbServer::IndexWALRecords(const std::vector<WALRecord>& records,
+                               const std::vector<long>& offsets) {
+  std::lock_guard<std::mutex> lock(wal_index_mutex);
+  for (size_t i = 0; i < records.size(); ++i) {
+    const WALRecord& r = records[i];
+    if (r.type != WALRecordType::UPDATE) continue;
+    if (r.offset != 0 || r.after_image.size() != Page::UsableSize()) {
+      throw std::runtime_error(
+          "WAL replay requires every UPDATE to be a full-page image "
+          "(page " +
+          std::to_string(r.page_id) +
+          " is not); use "
+          "MINIDB_REPLICA_MODE=flush or change the writer");
+    }
+    auto it = wal_index.find(r.page_id);
+    if (it == wal_index.end() || r.lsn >= it->second.lsn)
+      wal_index[r.page_id] = WALLoc{offsets[i], r.lsn};
+  }
+}
+
+bool DbServer::WALPageProvider(PageId page_id, Page* page) {
+  WALLoc loc;
+  {
+    std::lock_guard<std::mutex> lock(wal_index_mutex);
+    auto it = wal_index.find(page_id);
+    if (it == wal_index.end()) {
+      disk_page_reads.fetch_add(1);
+      return false;
+    }
+    loc = it->second;
+  }
+  WALRecord rec;
+  if (!wal->ReadRecordAt(loc.offset, &rec) ||
+      rec.type != WALRecordType::UPDATE || rec.page_id != page_id ||
+      rec.lsn != loc.lsn || rec.after_image.size() != Page::UsableSize()) {
+    throw std::runtime_error("WALPageProvider: WAL record for page " +
+                             std::to_string(page_id) + " at offset " +
+                             std::to_string(loc.offset) +
+                             " is missing or does not match the index");
+  }
+  std::memset(page->GetData(), 0, Page::HeaderSize());
+  std::memcpy(page->GetData() + Page::HeaderSize(), rec.after_image.data(),
+              Page::UsableSize());
+  page->SetLSN(rec.lsn);
+  wal_page_reads.fetch_add(1);
+  return true;
 }
 
 void DbServer::ServeWithEpoll(
@@ -287,7 +397,8 @@ std::string DbServer::RunAutocommit(const std::string& sql) {
 
   if (touches_wal) {
     if (!is_primary.load()) {
-      return "ERR this server is not the primary -- writes must be sent to the "
+      return "ERR this server is not the primary -- writes must be sent to "
+             "the "
              "primary";
     }
     std::shared_lock<std::shared_mutex> lock(engine_mutex);
@@ -342,6 +453,22 @@ void DbServer::HandleControlConnection(int fd) {
 
 std::string DbServer::ProcessControlMessage(const std::string& line) {
   if (line == "PING") return "PONG";
+
+  if (line == "STATS") {
+    size_t indexed;
+    {
+      std::lock_guard<std::mutex> l(wal_index_mutex);
+      indexed = wal_index.size();
+    }
+    return std::string("OK mode=") + (wal_mode ? "wal" : "flush") +
+           " wal_reads=" + std::to_string(wal_page_reads.load()) +
+           " disk_reads=" + std::to_string(disk_page_reads.load()) +
+           " flush_requests=" + std::to_string(flush_requests.load()) +
+           " indexed_pages=" + std::to_string(indexed) +
+           " notify_calls=" + std::to_string(notify_calls.load()) +
+           " notify_rounds=" + std::to_string(notify_rounds.load()) +
+           " notify_busy_ms=" + std::to_string(notify_busy_ns.load() / 1000000);
+  }
 
   if (line == "STATUS") {
     return "STATUS " + std::string(is_primary.load() ? "PRIMARY" : "REPLICA") +

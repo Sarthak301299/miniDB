@@ -37,6 +37,7 @@ class BufferPool {
   std::vector<std::unique_ptr<Shard>> shards;
   std::function<void(PageId)> pre_disk_read_hook;
   std::function<void(PageId, LSN)> post_disk_read_hook;
+  std::function<bool(PageId, Page*)> page_provider;
 
  public:
   BufferPool(size_t pool_size, DiskManager* disk, WALManager* wal,
@@ -52,6 +53,9 @@ class BufferPool {
   }
   void SetPostDiskReadHook(std::function<void(PageId, LSN)> hook) {
     post_disk_read_hook = std::move(hook);
+  }
+  void SetPageProvider(std::function<bool(PageId, Page*)> provider) {
+    page_provider = std::move(provider);
   }
 };
 }  // namespace minidb

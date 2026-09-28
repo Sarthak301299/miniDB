@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -72,7 +73,7 @@ bool SendLine(int fd, const std::string& line) {
   std::string msg = line + "\n";
   size_t sent = 0;
   while (sent < msg.size()) {
-    ssize_t n = ::send(fd, msg.data() + sent, msg.size() - sent, 0);
+    ssize_t n = ::send(fd, msg.data() + sent, msg.size() - sent, MSG_NOSIGNAL);
     if (n <= 0) return false;
     sent += static_cast<size_t>(n);
   }
@@ -94,7 +95,7 @@ namespace {
 bool SendAll(int fd, const char* data, size_t len) {
   size_t sent = 0;
   while (sent < len) {
-    ssize_t n = ::send(fd, data + sent, len - sent, 0);
+    ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
     if (n <= 0) return false;
     sent += static_cast<size_t>(n);
   }
@@ -176,6 +177,60 @@ std::string PersistentConnection::SendAndRecv(const std::string& line) {
     return response2;
   }
   return response;
+}
+
+std::vector<std::string> PersistentConnection::SendAndRecvAll(
+    const std::vector<PersistentConnection*>& conns, const std::string& line) {
+  const size_t n = conns.size();
+  std::vector<std::string> replies(n);
+  if (n == 0) return replies;
+  std::vector<PersistentConnection*> lock_order(conns);
+  std::sort(lock_order.begin(), lock_order.end());
+  lock_order.erase(std::unique(lock_order.begin(), lock_order.end()),
+                   lock_order.end());
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(lock_order.size());
+  for (auto* c : lock_order) locks.emplace_back(c->mutex);
+  std::vector<std::string> errors(n);
+  std::vector<bool> sent(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    PersistentConnection* c = conns[i];
+    if (c->port < 0) {
+      errors[i] =
+          "PersistentConnection: SendAndRecvAll called before SetTarget";
+      continue;
+    }
+    try {
+      if (c->fd < 0) c->fd = ConnectWithRetry(c->host, c->port, 10);
+      sent[i] = SendLine(c->fd, line);
+    } catch (const std::exception&) {
+      c->fd = -1;
+      sent[i] = false;
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    PersistentConnection* c = conns[i];
+    if (!errors[i].empty()) continue;
+    if (sent[i] && RecvLine(c->fd, &replies[i])) continue;
+    if (c->fd >= 0) CloseSocket(c->fd);
+    c->fd = -1;
+    try {
+      c->fd = ConnectWithRetry(c->host, c->port, 10);
+      if (!SendLine(c->fd, line) || !RecvLine(c->fd, &replies[i])) {
+        CloseSocket(c->fd);
+        c->fd = -1;
+        errors[i] = "PersistentConnection: request to " + c->host + ":" +
+                    std::to_string(c->port) + " failed even after reconnecting";
+      }
+    } catch (const std::exception& e) {
+      c->fd = -1;
+      errors[i] = e.what();
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (!errors[i].empty()) throw std::runtime_error(errors[i]);
+  }
+  return replies;
 }
 
 }  // namespace net

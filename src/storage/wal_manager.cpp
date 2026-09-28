@@ -140,7 +140,8 @@ void WALManager::Flush(LSN upto) {
 std::vector<WALRecord> WALManager::ReadAll() { return ReadAll(0, nullptr); }
 
 std::vector<WALRecord> WALManager::ReadAll(long start_offset,
-                                           long* out_end_offset) {
+                                           long* out_end_offset,
+                                           std::vector<long>* out_offsets) {
   std::vector<WALRecord> records;
   int rfd = ::open(file_name.c_str(), O_RDONLY);
   if (rfd < 0) {
@@ -160,6 +161,7 @@ std::vector<WALRecord> WALManager::ReadAll(long start_offset,
     if (n != static_cast<ssize_t>(len)) break;
     try {
       records.push_back(WALRecord::Deserialize(buf.data(), len));
+      if (out_offsets) out_offsets->push_back(pos);
     } catch (const std::exception&) {
       break;
     }
@@ -168,6 +170,25 @@ std::vector<WALRecord> WALManager::ReadAll(long start_offset,
   ::close(rfd);
   if (out_end_offset) *out_end_offset = pos;
   return records;
+}
+
+bool WALManager::ReadRecordAt(long offset, WALRecord* out) const {
+  uint32_t len = 0;
+  if (::pread(fd, &len, sizeof(len), offset) !=
+      static_cast<ssize_t>(sizeof(len)))
+    return false;
+  constexpr uint32_t max_record_size = 16 * 1024 * 1024;
+  if (len == 0 || len > max_record_size) return false;
+  std::vector<char> buf(len);
+  if (::pread(fd, buf.data(), len, offset + static_cast<long>(sizeof(len))) !=
+      static_cast<ssize_t>(len))
+    return false;
+  try {
+    *out = WALRecord::Deserialize(buf.data(), len);
+  } catch (const std::exception&) {
+    return false;
+  }
+  return true;
 }
 
 LSN WALManager::FlushedLSN() const { return flushed_lsn; }

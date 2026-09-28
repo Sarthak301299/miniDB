@@ -30,6 +30,8 @@ class PersistentConnection {
   PersistentConnection& operator=(const PersistentConnection&) = delete;
   void SetTarget(const std::string& host, int port);
   std::string SendAndRecv(const std::string& line);
+  static std::vector<std::string> SendAndRecvAll(
+      const std::vector<PersistentConnection*>& conns, const std::string& line);
 };
 }  // namespace net
 }  // namespace minidb

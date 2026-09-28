@@ -62,7 +62,8 @@ Page* BufferPool::FetchPage(PageId page_id) {
     size_t idx = static_cast<size_t>(f - &shard.frames[0]);
     if (f->stale && f->pin_count == 0) {
       if (pre_disk_read_hook) pre_disk_read_hook(page_id);
-      disk->ReadPage(page_id, f->page.GetData());
+      if (!(page_provider && page_provider(page_id, &f->page)))
+        disk->ReadPage(page_id, f->page.GetData());
       if (post_disk_read_hook) post_disk_read_hook(page_id, f->page.GetLSN());
       f->stale = false;
       f->is_dirty = false;
@@ -74,7 +75,8 @@ Page* BufferPool::FetchPage(PageId page_id) {
   }
   Frame* f = EvictFrameInShard(shard);
   if (pre_disk_read_hook) pre_disk_read_hook(page_id);
-  disk->ReadPage(page_id, f->page.GetData());
+  if (!(page_provider && page_provider(page_id, &f->page)))
+    disk->ReadPage(page_id, f->page.GetData());
   if (post_disk_read_hook) post_disk_read_hook(page_id, f->page.GetLSN());
   f->page_id = page_id;
   f->pin_count = 1;

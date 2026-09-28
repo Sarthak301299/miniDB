@@ -43,7 +43,9 @@ class WALManager {
   LSN Append(WALRecord record);
   void Flush(LSN upto = INVALID_LSN);
   std::vector<WALRecord> ReadAll();
-  std::vector<WALRecord> ReadAll(long start_offset, long* out_end_offset);
+  std::vector<WALRecord> ReadAll(long start_offset, long* out_end_offset,
+                                 std::vector<long>* out_offsets = nullptr);
+  bool ReadRecordAt(long offset, WALRecord* out) const;
   LSN FlushedLSN() const;
   bool IsReadOnly() const { return read_only; }
 };

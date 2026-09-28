@@ -1,10 +1,12 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -56,6 +58,34 @@ class DbServer {
 
   int query_listen_fd = -1;
   int control_listen_fd = -1;
+
+  struct WALLoc {
+    long offset;
+    LSN lsn;
+  };
+  std::mutex wal_index_mutex;
+  std::unordered_map<PageId, WALLoc> wal_index;
+  bool wal_mode = true;
+  std::atomic<uint64_t> wal_page_reads{0};
+  std::atomic<uint64_t> disk_page_reads{0};
+  std::atomic<uint64_t> flush_requests{0};
+
+  void DoNotifyRound();
+  std::mutex notify_mu;
+  std::condition_variable notify_cv;
+  uint64_t notify_rounds_started = 0;
+  uint64_t notify_rounds_completed = 0;
+  bool notify_round_in_flight = false;
+  struct NotifyErr {
+    uint64_t round = 0;
+    std::string msg;
+  };
+  static constexpr size_t notify_err_ring = 256;
+  NotifyErr notify_errors[notify_err_ring];
+  std::atomic<uint64_t> notify_calls{0};
+  std::atomic<uint64_t> notify_rounds{0};
+  std::atomic<uint64_t> notify_busy_ns{0};
+
   void ServeWithEpoll(int listen_fd, int threads,
                       std::function<std::string(const std::string&)> handler);
   std::string ProcessQuery(const std::string& line);
@@ -68,6 +98,9 @@ class DbServer {
   void RequestPrimaryFlushPage(PageId page_id);
   void PreDiskReadHook(PageId page_id);
   void PostDiskReadHook(PageId page_id, LSN page_lsn);
+  bool WALPageProvider(PageId page_id, Page* page);
+  void IndexWALRecords(const std::vector<WALRecord>& records,
+                       const std::vector<long>& offsets);
   void BuildEngineStackLocked(bool read_only);
 
  public:
