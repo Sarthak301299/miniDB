@@ -66,8 +66,12 @@ std::vector<char> SerializeCatalog(
     AppendU16(&out, static_cast<uint16_t>(table.schema.columns.size()));
     for (const auto& col : table.schema.columns) {
       AppendString(&out, col.name);
-      AppendU8(&out, static_cast<uint8_t>(col.type));
+      AppendU8(&out, static_cast<uint8_t>(col.type) | (col.masked ? 0x80 : 0));
       AppendU32(&out, col.dim);
+      if (col.masked) {
+        AppendU16(&out, col.mask_first);
+        AppendU16(&out, col.mask_last);
+      }
     }
     AppendU16(&out, static_cast<uint16_t>(table.pages.size()));
     for (const auto& page_id : table.pages) AppendI64(&out, page_id);
@@ -122,7 +126,7 @@ class Reader {
     return static_cast<uint8_t>(data[pos++]);
   }
 
-  uint16_t ReadU32() {
+  uint32_t ReadU32() {
     Need(sizeof(uint32_t));
     uint32_t v;
     std::memcpy(&v, data + pos, sizeof(v));
@@ -130,7 +134,7 @@ class Reader {
     return v;
   }
 
-  uint16_t ReadFloat() {
+  float ReadFloat() {
     Need(sizeof(float));
     float v;
     std::memcpy(&v, data + pos, sizeof(v));
@@ -173,8 +177,14 @@ DeserializedCatalog DeserializeCatalog(const char* data, size_t len) {
     for (uint16_t c = 0; c < num_cols; ++c) {
       Column col;
       col.name = r.ReadString();
-      col.type = static_cast<ColumnType>(r.ReadU8());
+      uint8_t type_byte = r.ReadU8();
+      col.type = static_cast<ColumnType>(type_byte & 0x7F);
       col.dim = r.ReadU32();
+      if (type_byte & 0x80) {
+        col.masked = true;
+        col.mask_first = r.ReadU16();
+        col.mask_last = r.ReadU16();
+      }
       t.schema.name_to_index[col.name] =
           static_cast<uint64_t>(t.schema.columns.size());
       t.schema.columns.push_back(col);

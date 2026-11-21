@@ -176,6 +176,19 @@ class Parser {
                              Peek().text);
   }
 
+  uint16_t ExpectMaskCount() {
+    const std::string& t = Peek().text;
+    if (Peek().type != TokenType::NUMBER || t.empty() ||
+        !std::all_of(t.begin(), t.end(),
+                     [](unsigned char c) { return std::isdigit(c); }) ||
+        t.size() > 4) {
+      throw std::runtime_error(
+          "MASKED(first,last) expects two non-negative integers <= 9999, got " +
+          t);
+    }
+    return static_cast<uint16_t>(std::stoul(Advance().text));
+  }
+
   CreateTableStmt ParseCreateTable() {
     ExpectKeyword("TABLE");
     CreateTableStmt stmt;
@@ -200,6 +213,19 @@ class Parser {
       } else
         throw std::runtime_error("ParseCreateTable: Unknown column type " +
                                  type_kw + " (supported: INT, TEXT)");
+
+      if (AtKeyword("MASKED")) {
+        Advance();
+        ExpectSymbol("(");
+        col.masked = true;
+        col.mask_first = ExpectMaskCount();
+        ExpectSymbol(",");
+        col.mask_last = ExpectMaskCount();
+        ExpectSymbol(")");
+      }
+      if (stmt.schema.name_to_index.contains(col.name))
+        throw std::runtime_error("ParseCreateTable: Duplicate column name " +
+                                 col.name);
 
       stmt.schema.name_to_index[col.name] =
           static_cast<uint64_t>(stmt.schema.columns.size());

@@ -176,6 +176,26 @@ round-robin across all live servers.
 - Aggregates use the columnar cache when it exists. The cache is **not updated automatically**, so results are stale until the next `REFRESH COLUMNAR`.
 - Vector queries probe 4 clusters (fewer if the index has fewer), then rank candidates by exact distance.
 
+## Masked columns
+
+Mark a column `MASKED(first,last)` to keep it out of query results:
+
+```sql
+CREATE TABLE people (id INT, ssn TEXT MASKED(0,4), pin INT MASKED(0,4), emb VECTOR(3) MASKED(0,0));
+SELECT * FROM people;   -- 1 | XXXXXXX6789 | XXX6789 | [MASKED]
+```
+
+- The first `first` and last `last` characters stay visible, the rest become `X`. Counting is by UTF-8 code point.
+- **Short values are fully masked**: if the length is at most `first+last`, every character is replaced. `INT` columns are masked through their decimal text and returned as text. `VECTOR` columns always return `[MASKED]`. An empty string stays empty.
+- Masking is applied inside the engine before the result is encoded, so every access path (`SeqScan`, `IndexScan`, vector scan, `SELECT *`) and every server, replicas included, behaves the same.
+- It is unconditional. There are no roles or sessions, so nobody can ask for the raw value.
+- Because predicates, ordering and aggregates would let a caller recover a hidden value by bisection, these are **rejected** on a masked column: `WHERE` (also in `DELETE`), `COUNT/SUM/AVG/MIN/MAX(col)`, `ORDER BY col <->`, and `CREATE [VECTOR] INDEX` on it. `COUNT(*)` is still allowed. Because masked predicates are rejected, a plan description or error message never contains a masked value.
+- The attribute is stored in the catalog (flag bit in the column type byte), so it survives restart, replica reload and failover. Catalogs written before this feature load unchanged.
+
+**What this is not.** It is an output filter. The data file and WAL still hold the plaintext, there is no encryption in transit, no audit log, and `COUNT(*)` plus the visible first/last characters still leak some information. Treat it as a defence against accidental exposure through query results, not as storage-level protection.
+
+![Masked Columns Example](results/masked_cols.png)
+
 ## How it works
 
 **Crash recovery.** Every page modification appends a WAL record holding the *full after-image* of

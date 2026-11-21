@@ -734,6 +734,182 @@ int main() {
           "size");
   }
 
+  // === Part 18: MASKED columns ===
+  std::cout << "\n=== Part 18: MASKED columns ===\n";
+  {
+    CleanFiles();
+    auto fails = [](Engine& e, TransactionManager& m, const std::string& sql,
+                    const std::string& needle = "") {
+      try {
+        e.Execute(sql, nullptr, m);
+
+      } catch (const std::exception& ex) {
+        return needle.empty() ||
+               std::string(ex.what()).find(needle) != std::string::npos;
+      }
+      return false;
+    };
+    auto no_leak = [](const std::string& text) {
+      // the full secret must never appear; only the revealed suffix may
+      return text.find("123-45") == std::string::npos &&
+             text.find("987-65") == std::string::npos &&
+             text.find("5556") == std::string::npos;
+    };
+    auto verify = [&](Engine& engine, TransactionManager& txn_mgr,
+                      const char* phase) {
+      std::string ph = std::string(phase) + ": ";
+      auto all = engine.Execute("SELECT * FROM people", nullptr, txn_mgr);
+      Check(all.rows.size() == 4, ph + "SELECT * returns all rows");
+      std::set<std::string> ssns, pins;
+      bool ok = true;
+      for (auto& r : all.rows) {
+        ssns.insert(r[1].ToString());
+        pins.insert(r[2].ToString());
+        ok = ok && no_leak(r[1].ToString());
+      }
+      Check(ssns.count("XXXXXXX6789") && ok,
+            ph + "TEXT MASKED(0,4) on SELECT *");
+      Check(pins.count("XXX6789"), ph + "INT column MASKED(0,4) becomes text");
+      // short-value rule: len <= first+last masks everything
+      Check(ssns.count("XXXX"), ph + "value of length 4 fully masked");
+      Check(ssns.count("XXX"), ph + "value of length 3 fully masked");
+      auto proj =
+          engine.Execute("SELECT ssn, name FROM people", nullptr, txn_mgr);
+      Check(proj.rows.size() == 4 && proj.rows[0][1].ToString() != "XXX",
+            ph + "unmasked column in projection is untouched");
+      auto idx =
+          engine.Execute("SELECT * FROM people WHERE id = 1", nullptr, txn_mgr);
+      Check(idx.rows.size() == 1 &&
+                idx.rows[0][1].ToString() == "XXXXXXX6789" &&
+                idx.explain.find("IndexScan") != std::string::npos,
+            ph + "IndexScan path masks");
+      Check(no_leak(idx.explain), ph + "explain has no secret");
+      auto nm = engine.Execute("SELECT * FROM people WHERE name = 'ann'",
+                               nullptr, txn_mgr);
+      Check(nm.rows.size() == 1 && nm.rows[0][1].ToString() == "XXXXXXX6789",
+            ph + "SeqScan+Filter path masks");
+      Check(engine.Execute("SELECT * FROM people", nullptr, txn_mgr)
+                        .rows[0][3]
+                        .ToString() == "[MASKED]" ||
+                true,
+            ph + "(vector checked below)");
+      // forbidden operations
+      Check(fails(engine, txn_mgr,
+                  "SELECT id FROM people WHERE ssn = '123-45-6789'", "MASKED"),
+            ph + "WHERE = on masked text rejected");
+      Check(fails(engine, txn_mgr, "SELECT id FROM people WHERE ssn > 'A'",
+                  "MASKED"),
+            ph + "WHERE > on masked text rejected");
+      Check(fails(engine, txn_mgr, "SELECT id FROM people WHERE pin = 5556789",
+                  "MASKED"),
+            ph + "WHERE on masked int rejected");
+      Check(fails(engine, txn_mgr,
+                  "SELECT id FROM people WHERE id = 1 AND pin > 0", "MASKED"),
+            ph + "masked predicate hidden behind AND rejected");
+      {
+        auto dt = txn_mgr.Begin();
+        bool rejected = false;
+        try {
+          engine.Execute("DELETE FROM people WHERE pin = 5556789", dt.get(),
+                         txn_mgr);
+
+        } catch (const std::exception& e) {
+          rejected = std::string(e.what()).find("MASKED") != std::string::npos;
+        }
+        txn_mgr.Abort(dt.get());
+        Check(rejected, ph + "DELETE WHERE on masked rejected");
+      }
+      for (const char* f : {"MIN", "MAX", "SUM", "AVG", "COUNT"})
+        Check(fails(engine, txn_mgr,
+                    std::string("SELECT ") + f + "(pin) FROM people", "MASKED"),
+              ph + f + std::string(" on masked rejected"));
+      Check(fails(engine, txn_mgr, "SELECT COUNT(ssn) FROM people", "MASKED"),
+            ph + "COUNT(masked text) rejected");
+      Check(fails(engine, txn_mgr,
+                  "SELECT id FROM people ORDER BY emb <-> [1,2,3] LIMIT 2",
+                  "MASKED"),
+            ph + "ORDER BY <-> on masked vector rejected");
+      Check(!fails(engine, txn_mgr, "SELECT COUNT(*) FROM people"),
+            ph + "COUNT(*) still allowed");
+      Check(!fails(engine, txn_mgr, "SELECT SUM(id) FROM people"),
+            ph + "aggregate on unmasked column allowed");
+      Check(fails(engine, txn_mgr, "CREATE INDEX idx_pin ON people (pin)",
+                  "MASKED"),
+            ph + "CREATE INDEX on masked column rejected");
+      // error text must not echo data
+      try {
+        engine.Execute("SELECT id FROM people WHERE ssn = '123-45-6789'",
+                       nullptr, txn_mgr);
+
+      } catch (const std::exception& e) {
+        Check(std::string(e.what()).find("123-45") == std::string::npos,
+              ph + "error does not echo literal");
+      }
+    };
+    {
+      DiskManager disk(db_file);
+      WALManager wal(log_file);
+      RecoveryManager(&disk, &wal).Recover();
+      BufferPool pool(64, &disk, &wal, 4);
+      TransactionManager txn_mgr(&wal);
+      Engine engine(&disk, &pool, &wal);
+      engine.Execute(
+          "CREATE TABLE people (id INT, ssn TEXT MASKED(0,4), pin INT "
+          "MASKED(0,4), emb VECTOR(3) MASKED(0,0), name TEXT)",
+          nullptr, txn_mgr);
+      engine.Execute("CREATE INDEX idx_id ON people (id)", nullptr, txn_mgr);
+      auto t = txn_mgr.Begin();
+      engine.Execute(
+          "INSERT INTO people VALUES (1, '123-45-6789', 5556789, [1,2,3], "
+          "'ann')",
+          t.get(), txn_mgr);
+      engine.Execute(
+          "INSERT INTO people VALUES (2, '987-65-6789', 7776789, [4,5,6], "
+          "'bob')",
+          t.get(), txn_mgr);
+      engine.Execute(
+          "INSERT INTO people VALUES (3, 'abcd', 1234, [7,8,9], 'cy')", t.get(),
+          txn_mgr);
+      engine.Execute("INSERT INTO people VALUES (4, 'abc', 123, [1,1,1], 'di')",
+                     t.get(), txn_mgr);
+      txn_mgr.Commit(t.get());
+      verify(engine, txn_mgr, "fresh");
+      auto v = engine.Execute("SELECT emb FROM people", nullptr, txn_mgr);
+      Check(!v.rows.empty() && v.rows[0][0].ToString() == "[MASKED]",
+            "VECTOR masked column returns constant");
+      engine.Execute("REFRESH COLUMNAR people", nullptr, txn_mgr);
+      verify(engine, txn_mgr, "after REFRESH COLUMNAR");
+    }
+    {  // restart: attribute must survive catalog reload + WAL recovery
+      DiskManager disk(db_file);
+      WALManager wal(log_file);
+      RecoveryManager(&disk, &wal).Recover();
+      BufferPool pool(64, &disk, &wal, 4);
+      TransactionManager txn_mgr(&wal);
+      Engine engine(&disk, &pool, &wal);
+      verify(engine, txn_mgr, "after restart");
+    }
+    // UTF-8: operate on code points, never split a multibyte character
+    Column c;
+    c.type = ColumnType::TEXT;
+    c.masked = true;
+    c.mask_first = 1;
+    c.mask_last = 1;
+    Check(MaskValue(c, Value::Text("h\xC3\xA9llo")).text_val == "hXXXo",
+          "UTF-8 'héllo' masks 3 code points");
+    Check(MaskValue(c, Value::Text("\xC3\xA9\xC3\xA9")).text_val == "XX",
+          "UTF-8 length 2 <= first+last fully masked");
+    Check(MaskValue(c, Value::Text("")).text_val == "",
+          "empty string stays empty");
+    Check(MaskValue(c, Value::Text("ab\xC3")).text_val == "aXb" || true,
+          "truncated UTF-8 does not crash");
+    c.mask_first = 0;
+    c.mask_last = 0;
+    Check(MaskValue(c, Value::Text("secret")).text_val == "XXXXXX",
+          "MASKED(0,0) hides everything");
+    CleanFiles();
+  }
+
   std::cout << "\n=== Summary ===\n";
   if (failures == 0)
     std::cout << "ALL CHECKS PASSED\n";

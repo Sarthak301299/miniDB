@@ -11,6 +11,24 @@ std::string FormatDouble(double v) {
   oss << std::fixed << std::setprecision(4) << v;
   return oss.str();
 }
+
+void RejectMasked(const Schema& schema, const std::string& column,
+                  const std::string& what) {
+  int idx = schema.ColumnIndex(column);
+  if (idx >= 0 && schema.columns[static_cast<size_t>(idx)].masked) {
+    throw std::runtime_error(what + " on MASKED column " + column +
+                             " is not allowed");
+  }
+}
+
+void MaskRows(const Schema& schema, const std::vector<int>& col_indices,
+              std::vector<std::vector<Value>>* rows) {
+  for (size_t j = 0; j < col_indices.size(); ++j) {
+    const Column& col = schema.columns[static_cast<size_t>(col_indices[j])];
+    if (!col.masked) continue;
+    for (auto& row : *rows) row[j] = MaskValue(col, row[j]);
+  }
+}
 }  // namespace
 
 QueryResult Engine::ExecuteCreateTable(const CreateTableStmt& stmt) {
@@ -22,6 +40,9 @@ QueryResult Engine::ExecuteCreateTable(const CreateTableStmt& stmt) {
 }
 
 QueryResult Engine::ExecuteCreateIndex(const CreateIndexStmt& stmt) {
+  if (auto s = catalog.GetSchema(stmt.table)) {
+    RejectMasked(*s, stmt.column, "CREATE INDEX");
+  }
   if (!catalog.CreateIndex(stmt.index_name, stmt.table, stmt.column)) {
     throw std::runtime_error(
         "ExecuteCreateIndex: CREATE INDEX " + stmt.index_name +
@@ -33,6 +54,9 @@ QueryResult Engine::ExecuteCreateIndex(const CreateIndexStmt& stmt) {
 
 QueryResult Engine::ExecuteCreateVectorIndex(
     const CreateVectorIndexStmt& stmt) {
+  if (auto s = catalog.GetSchema(stmt.table)) {
+    RejectMasked(*s, stmt.column, "CREATE VECTOR INDEX");
+  }
   if (!catalog.CreateVectorIndex(stmt.index_name, stmt.table, stmt.column,
                                  stmt.num_clusters)) {
     throw std::runtime_error(
@@ -120,6 +144,7 @@ QueryResult Engine::ExecuteAggregate(const AggregateSpec& agg,
                                      const Schema* schema, HeapFile* heap,
                                      TxnId reader_txn,
                                      const TransactionManager& txn_mgr) {
+  if (agg.column != "*") RejectMasked(*schema, agg.column, agg.func);
   if (agg.func != "COUNT") {
     int col_idx = schema->ColumnIndex(agg.column);
     if (col_idx < 0)
@@ -211,6 +236,7 @@ QueryResult Engine::ExecuteKNN(const KNNSpec& knn, const SelectStmt& stmt,
                                const Schema* schema, HeapFile* heap,
                                TxnId reader_txn,
                                const TransactionManager& txn_mgr) {
+  RejectMasked(*schema, knn.column, "ORDER BY <->");
   auto index = catalog.GetVectorIndex(stmt.table, knn.column);
   if (!index)
     throw std::runtime_error("No vector index on " + stmt.table + "." +
@@ -260,6 +286,7 @@ QueryResult Engine::ExecuteKNN(const KNNSpec& knn, const SelectStmt& stmt,
       projected.push_back(values[static_cast<size_t>(idx)]);
     result.rows.push_back(std::move(projected));
   }
+  MaskRows(*schema, col_indices, &result.rows);
   return result;
 }
 
@@ -271,6 +298,7 @@ QueryResult Engine::ExecuteSelect(const SelectStmt& stmt, Transaction* txn,
   const Schema* schema = &*schema_opt;
   auto heap = catalog.GetHeap(stmt.table);
   TxnId reader_txn = txn ? txn->id : INVALID_TXN_ID;
+  for (const auto& p : stmt.where) RejectMasked(*schema, p.column, "WHERE");
 
   if (stmt.aggregate) {
     return ExecuteAggregate(*stmt.aggregate, stmt, schema, heap.get(),
@@ -297,6 +325,15 @@ QueryResult Engine::ExecuteSelect(const SelectStmt& stmt, Transaction* txn,
   std::vector<Value> row;
   while (plan->Next(&row)) result.rows.push_back(row);
   plan->Close();
+  std::vector<int> col_indices;
+  for (const auto& c : out_columns) {
+    int idx = schema->ColumnIndex(c);
+    if (idx < 0)
+      throw std::runtime_error("ExecuteSelect: Unknown column " + c +
+                               " in SELECT list");
+    col_indices.push_back(idx);
+  }
+  MaskRows(*schema, col_indices, &result.rows);
   return result;
 }
 
@@ -309,6 +346,7 @@ QueryResult Engine::ExecuteDelete(const DeleteStmt& stmt, Transaction* txn,
   if (!schema_opt)
     throw std::runtime_error("ExecuteSelect: Unknown table " + stmt.table);
   const Schema* schema = &*schema_opt;
+  for (const auto& p : stmt.where) RejectMasked(*schema, p.column, "WHERE");
   auto heap = catalog.GetHeap(stmt.table);
   auto rows = heap->Scan(txn->id, txn_mgr);
   size_t deleted = 0;

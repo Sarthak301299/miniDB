@@ -11,6 +11,9 @@ struct Column {
   std::string name;
   ColumnType type;
   uint32_t dim = 0;
+  bool masked = false;
+  uint16_t mask_first = 0;
+  uint16_t mask_last = 0;
 };
 
 struct Schema {
@@ -72,6 +75,8 @@ std::vector<char> SerializeRow(const Schema& schema,
                                const std::vector<Value>& values);
 std::vector<Value> DeserializeRow(const Schema& schema,
                                   const std::vector<char>& bytes);
+
+Value MaskValue(const Column& col, const Value& v);
 
 float SquaredL2Distance(const std::vector<float>& a,
                         const std::vector<float>& b);

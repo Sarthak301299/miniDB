@@ -4,6 +4,30 @@
 #include <stdexcept>
 
 namespace minidb {
+
+namespace {
+std::vector<size_t> CodePointStarts(const std::string& s) {
+  std::vector<size_t> starts;
+  size_t i = 0;
+  while (i < s.size()) {
+    starts.push_back(i);
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    size_t len = c < 0x80           ? 1
+                 : (c >> 5) == 0x6  ? 2
+                 : (c >> 4) == 0xE  ? 3
+                 : (c >> 3) == 0x1E ? 4
+                                    : 1;
+    size_t j = 1;
+    while (j < len && i + j < s.size() &&
+           (static_cast<unsigned char>(s[i + j]) & 0xC0) == 0x80) {
+      ++j;
+    }
+    i += j;
+  }
+  return starts;
+}
+}  // namespace
+
 std::vector<char> SerializeRow(const Schema& schema,
                                const std::vector<Value>& values) {
   if (schema.columns.size() != values.size())
@@ -91,6 +115,24 @@ std::vector<Value> DeserializeRow(const Schema& schema,
     }
   }
   return out;
+}
+
+Value MaskValue(const Column& col, const Value& v) {
+  if (col.type == ColumnType::VECTOR) return Value::Text("[MASKED]");
+  std::string s =
+      col.type == ColumnType::INTEGER ? std::to_string(v.int_val) : v.text_val;
+  auto starts = CodePointStarts(s);
+  const size_t n = starts.size();
+  const size_t keep =
+      static_cast<size_t>(col.mask_first) + static_cast<size_t>(col.mask_last);
+  const bool all = n <= keep;
+  const size_t head = all ? 0 : col.mask_first;
+  const size_t tail = all ? 0 : col.mask_last;
+  std::string out;
+  if (head) out.append(s, 0, starts[head]);
+  out.append(n - head - tail, 'X');
+  if (tail) out.append(s, starts[n - tail], std::string::npos);
+  return Value::Text(std::move(out));
 }
 
 float SquaredL2Distance(const std::vector<float>& a,
